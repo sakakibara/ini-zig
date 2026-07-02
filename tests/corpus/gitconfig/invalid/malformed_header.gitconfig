@@ -1,0 +1,3 @@
+; Exercises: a section header without the closing ] is a MalformedSectionHeader error
+[unclosed
+	key = value

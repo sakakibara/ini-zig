@@ -1,0 +1,8 @@
+; Exercises: basic gitconfig sections, tab-indented keys, = assignment
+[user]
+	name = Ada Lovelace
+	email = ada@example.com
+
+[core]
+	autocrlf = false
+	editor = vim

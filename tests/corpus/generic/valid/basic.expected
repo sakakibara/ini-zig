@@ -1,0 +1,4 @@
+core.bare = false
+core.editor = vim
+user.email = ada@example.com
+user.name = Ada

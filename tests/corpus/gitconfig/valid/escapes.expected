@@ -1,0 +1,5 @@
+core.quoted = hello world
+core.with-backslash = path\\to\\file
+core.with-newline = line1\nline2
+core.with-quote = say "hello"
+core.with-tab = col1\tcol2

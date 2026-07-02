@@ -1,0 +1,5 @@
+; Exercises: gitconfig does not allow global keys (global_keys = false);
+; a key before any section header is a parse error
+key = value
+[section]
+	other = ok

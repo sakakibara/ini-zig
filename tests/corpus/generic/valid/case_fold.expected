@@ -1,0 +1,3 @@
+core.bare = false
+user.email = ada@example.com
+user.name = Ada

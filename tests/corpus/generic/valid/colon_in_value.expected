@@ -1,0 +1,2 @@
+server.desc = a description with = sign inside
+server.url = https://example.com:8080/path

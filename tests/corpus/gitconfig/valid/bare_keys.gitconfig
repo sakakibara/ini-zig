@@ -1,0 +1,4 @@
+; bare keys: no value; raw value is empty, decodes to boolean true under gitconfig
+[core]
+	bare
+	fileMode = true

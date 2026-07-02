@@ -1,0 +1,8 @@
+; Exercises: inline # and ; are comment starters in unquoted values;
+; inside double quotes they are preserved as part of the value
+[test]
+	plain = value
+	with-hash = before # this is a comment
+	with-semi = before ; this is a comment
+	quoted-hash = "value # not a comment"
+	quoted-semi = "value ; not a comment"

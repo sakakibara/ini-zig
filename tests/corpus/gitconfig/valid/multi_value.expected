@@ -1,0 +1,4 @@
+remote.origin.push = refs/heads/main
+remote.origin.push = refs/heads/dev
+remote.origin.push = refs/heads/staging
+remote.origin.url = git@github.com:org/repo.git

@@ -1,0 +1,7 @@
+; Exercises: git value escape sequences: \", \\, \n, \t, \b
+[core]
+	quoted = "hello world"
+	with-tab = "col1\tcol2"
+	with-newline = "line1\nline2"
+	with-backslash = "path\\to\\file"
+	with-quote = "say \"hello\""

@@ -1,0 +1,6 @@
+s.interior = a\tb
+s.p1 = a"
+s.p2 = a   b
+s.p3 = a
+s.quoted-hash = v # keep
+s.tail = z

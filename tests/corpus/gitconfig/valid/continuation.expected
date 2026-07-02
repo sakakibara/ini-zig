@@ -1,0 +1,3 @@
+core.joined = one two
+core.literal = value\\
+core.next = standalone

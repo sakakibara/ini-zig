@@ -1,0 +1,5 @@
+test.plain = value
+test.quoted-hash = value # not a comment
+test.quoted-semi = value ; not a comment
+test.with-hash = before
+test.with-semi = before

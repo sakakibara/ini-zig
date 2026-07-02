@@ -1,0 +1,4 @@
+; Exercises: a backslash escape git does not recognize is a hard error
+; (git: fatal: bad config line). Only \" \\ \n \t \b and \<newline> are valid.
+[s]
+	key = bad\xescape

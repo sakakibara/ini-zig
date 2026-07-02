@@ -1,0 +1,4 @@
+core.autocrlf = false
+core.editor = vim
+user.email = ada@example.com
+user.name = Ada Lovelace

@@ -1,0 +1,5 @@
+; Exercises decision 4: git parses a bare/key=value entry trailing a section header
+[s]x
+[t] k = v
+[u] m = a \
+	b

@@ -1,0 +1,13 @@
+; Exercises escape-aware inline-comment stripping and comment-aware
+; continuation: P1 \" is a literal quote (not a span); P2 a comment on a
+; continuation line is stripped; P3 a trailing \ inside a comment is comment
+; text not a continuation, so `tail` stays a separate key; interior
+; whitespace (incl. tabs) is preserved verbatim; quoted comment chars are kept.
+[s]
+	p1 = a\" ; b
+	p2 = a \
+  b ; c
+	p3 = a ; c \
+	tail = z
+	interior = a	b
+	quoted-hash = "v # keep"

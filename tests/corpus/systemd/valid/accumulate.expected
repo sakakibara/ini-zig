@@ -1,0 +1,4 @@
+Service.Environment = HOME=/home/user
+Service.Environment = PATH=/usr/bin:/bin
+Service.Environment = DEBUG=1
+Service.ExecStart = /usr/bin/myservice

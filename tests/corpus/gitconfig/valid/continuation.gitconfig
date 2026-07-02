@@ -1,0 +1,7 @@
+; Exercises: backslash continuation joins the next line with its content;
+; double-backslash is a literal \ (escaped) and NOT a continuation marker
+[core]
+	joined = one \
+two
+	literal = value\\
+	next = standalone

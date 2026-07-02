@@ -1,0 +1,7 @@
+; Exercises: subsection names with \\ (literal backslash) and \" (literal quote)
+; git unescapes these when reading the subsection name
+[section "path\\to\\dir"]
+	key = value1
+
+[branch "fix-\"quoted\""]
+	key = value2

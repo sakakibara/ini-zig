@@ -1,0 +1,5 @@
+Service.ExecStart = /usr/bin/myservice
+Service.Restart = on-failure
+Service.Type = simple
+Unit.After = network.target
+Unit.Description = My Service

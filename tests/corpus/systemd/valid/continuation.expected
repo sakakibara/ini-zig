@@ -1,0 +1,2 @@
+Service.Description = Single line value
+Service.ExecStart = /usr/bin/myservice --config /etc/myservice.conf

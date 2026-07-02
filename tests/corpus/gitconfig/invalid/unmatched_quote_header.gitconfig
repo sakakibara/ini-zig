@@ -1,0 +1,6 @@
+; Exercises: a quoted-subsection header whose only double quote is the last
+; inner byte (the opening quote with no closing quote). The subsection slice
+; inner[q+1 .. inner.len-1] would run start>end; it must be rejected as a
+; MalformedSectionHeader, never an out-of-bounds slice.
+[TD6H47"]
+	key = value

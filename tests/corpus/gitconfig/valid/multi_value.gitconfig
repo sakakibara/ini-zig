@@ -1,0 +1,6 @@
+; Exercises: repeated keys accumulate into a list (gitconfig duplicate_keys = accumulate)
+[remote "origin"]
+	push = refs/heads/main
+	push = refs/heads/dev
+	push = refs/heads/staging
+	url = git@github.com:org/repo.git
