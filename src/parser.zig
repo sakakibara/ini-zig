@@ -1242,14 +1242,6 @@ const CountingAllocator = struct {
     }
 };
 
-/// Monotonic nanoseconds. Stands in for `std.time.Timer`, which 0.16 dropped;
-/// used only to bound the time-complexity regression tests.
-fn monotonicNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
 test "M1: continuation join allocates O(N), not O(N^2)" {
     const cases = [_]struct { d: Dialect, prefix: []const u8, cont: []const u8, last: []const u8 }{
         // Indent folds segments with '\n'; backslash concatenates with none.
@@ -1306,9 +1298,9 @@ test "M2: duplicate-key detection is sub-quadratic in time" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const t0 = monotonicNs();
+    const t0 = std.Io.Clock.Timestamp.now(testing.io, .awake);
     const root = try parse(arena.allocator(), src.items, .{ .dialect = Dialect.strict });
-    const elapsed_ms = (monotonicNs() - t0) / std.time.ns_per_ms;
+    const elapsed_ms: u64 = @intCast(@divFloor(@max(t0.untilNow(testing.io).raw.toNanoseconds(), 0), std.time.ns_per_ms));
 
     try testing.expectEqual(n, root.get("s").?.section.entries.len);
     try testing.expectEqualStrings("v0", root.get("s.k0").?.string);
@@ -1337,9 +1329,9 @@ test "M3: duplicate-section detection is sub-quadratic in time" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const t0 = monotonicNs();
+    const t0 = std.Io.Clock.Timestamp.now(testing.io, .awake);
     const root = try parse(arena.allocator(), src.items, .{ .dialect = Dialect.strict });
-    const elapsed_ms = (monotonicNs() - t0) / std.time.ns_per_ms;
+    const elapsed_ms: u64 = @intCast(@divFloor(@max(t0.untilNow(testing.io).raw.toNanoseconds(), 0), std.time.ns_per_ms));
 
     try testing.expectEqual(n, root.section.entries.len);
     try testing.expectEqualStrings("v", root.get("s0.k").?.string);

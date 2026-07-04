@@ -1249,14 +1249,6 @@ test "M4 stream: a logical line over max_line_len fails fast and stays bounded" 
     try testing.expect(er.bufCapacity() <= 16 * 1024);
 }
 
-/// Monotonic nanoseconds; `std.time.Timer` was dropped in 0.16. Used only to
-/// put a wall-clock ceiling on the linear-framing regression tests below.
-fn monotonicNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
 fn newlineFree(a: std.mem.Allocator, n: usize) ![]u8 {
     const blob = try a.alloc(u8, n);
     @memset(blob, 'a');
@@ -1274,9 +1266,9 @@ test "R3 stream: newline-free EventReader is LineTooLong, fast, and bounded" {
     var er = EventReader.fromReader(testing.allocator, &r, .{ .dialect = Dialect.generic, .max_line_len = cap });
     defer er.deinit();
 
-    const t0 = monotonicNs();
+    const t0 = std.Io.Clock.Timestamp.now(testing.io, .awake);
     try testing.expectError(error.LineTooLong, drainForError(&er));
-    const elapsed_ms = (monotonicNs() - t0) / std.time.ns_per_ms;
+    const elapsed_ms: u64 = @intCast(@divFloor(@max(t0.untilNow(testing.io).raw.toNanoseconds(), 0), std.time.ns_per_ms));
 
     // Linear framing (resume offset carried across pulls) completes in
     // sub-millisecond on any reasonable hardware. The ceiling is generous but
@@ -1303,9 +1295,9 @@ test "R3 stream: newline-free ValueStream is LineTooLong, fast, and bounded" {
     var item_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer item_arena.deinit();
 
-    const t0 = monotonicNs();
+    const t0 = std.Io.Clock.Timestamp.now(testing.io, .awake);
     try testing.expectError(error.LineTooLong, vs.next(item_arena.allocator()));
-    const elapsed_ms = (monotonicNs() - t0) / std.time.ns_per_ms;
+    const elapsed_ms: u64 = @intCast(@divFloor(@max(t0.untilNow(testing.io).raw.toNanoseconds(), 0), std.time.ns_per_ms));
     if (elapsed_ms > 2000) {
         std.debug.print("R3 ValueStream framing took {d} ms\n", .{elapsed_ms});
         return error.QuadraticTime;
