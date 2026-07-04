@@ -39,6 +39,61 @@ pub const EmitOptions = struct {
     indent: []const u8 = "",
     assign: []const u8 = " = ",
     blank_line_between_sections: bool = true,
+    /// `false` (default) preserves insertion/declaration order, so existing
+    /// output is byte-for-byte unchanged unless set. `true` emits each
+    /// section's key/value pairs, and the sections themselves, in ascending
+    /// byte-lexicographic order, recursively -- ordering only, not
+    /// canonicalization: values are still quoted/escaped exactly as before.
+    sort_keys: bool = false,
+};
+
+/// Ascending order over `(key, original index)`: keys compare
+/// byte-lexicographically; a tie (a duplicate key) breaks by original index
+/// so equal keys keep their original relative order (a stable sort).
+fn entryLess(entries: []const Entry, a: usize, b: usize) bool {
+    const ak = entries[a].key;
+    const bk = entries[b].key;
+    if (!std.mem.eql(u8, ak, bk)) return std.mem.lessThan(u8, ak, bk);
+    return a < b;
+}
+
+/// Index of the entry immediately following `after` in ascending
+/// `(key, original index)` order, or null once every entry has been visited.
+/// Selection-scan: O(n) per call, O(n^2) for a full pass. No allocation, so
+/// `encode` (which takes no allocator) can sort without one; `sort_keys`
+/// targets human-scale INI files where the quadratic cost is negligible.
+fn nextSortedIndex(entries: []const Entry, after: ?usize) ?usize {
+    var best: ?usize = null;
+    for (entries, 0..) |_, j| {
+        if (after) |a| {
+            if (!entryLess(entries, a, j)) continue;
+        }
+        if (best) |b| {
+            if (entryLess(entries, j, b)) best = j;
+        } else best = j;
+    }
+    return best;
+}
+
+/// Yields entry indices in original order, or ascending sorted order when
+/// `sort_keys` is set, so callers walk one loop regardless of `EmitOptions`.
+const EntryOrder = struct {
+    entries: []const Entry,
+    sort_keys: bool,
+    seq: usize = 0,
+    prev: ?usize = null,
+
+    fn next(self: *EntryOrder) ?usize {
+        if (!self.sort_keys) {
+            if (self.seq >= self.entries.len) return null;
+            const idx = self.seq;
+            self.seq += 1;
+            return idx;
+        }
+        const idx = nextSortedIndex(self.entries, self.prev) orelse return null;
+        self.prev = idx;
+        return idx;
+    }
 };
 
 /// Encode one optional struct field, recursing through any number of stacked
@@ -206,7 +261,9 @@ fn encodeRoot(
     }
 
     // Phase 1: global leaf entries (string/list directly under root).
-    for (root.entries) |entry| {
+    var leaves = EntryOrder{ .entries = root.entries, .sort_keys = options.sort_keys };
+    while (leaves.next()) |i| {
+        const entry = root.entries[i];
         switch (entry.value) {
             .string => |s| {
                 try emitKv(w, entry.key, s, options);
@@ -221,7 +278,9 @@ fn encodeRoot(
     }
 
     // Phase 2: section entries, each becoming one or more header blocks.
-    for (root.entries) |entry| {
+    var sections = EntryOrder{ .entries = root.entries, .sort_keys = options.sort_keys };
+    while (sections.next()) |i| {
+        const entry = root.entries[i];
         if (entry.value != .section) continue;
         try encodeSection(w, entry.key, entry.value.section, options, first);
     }
@@ -260,7 +319,9 @@ fn encodeSection(
             try w.writeByte('[');
             try w.writeAll(name);
             try w.writeAll("]\n");
-            for (sec.entries) |e| {
+            var it = EntryOrder{ .entries = sec.entries, .sort_keys = options.sort_keys };
+            while (it.next()) |i| {
+                const e = sec.entries[i];
                 switch (e.value) {
                     .string => |s| try emitKv(w, e.key, s, options),
                     .list => |items| try emitList(w, e.key, items, options),
@@ -270,7 +331,9 @@ fn encodeSection(
         }
 
         // Emit each child section as [name "child"].
-        for (sec.entries) |e| {
+        var subs = EntryOrder{ .entries = sec.entries, .sort_keys = options.sort_keys };
+        while (subs.next()) |i| {
+            const e = sec.entries[i];
             if (e.value != .section) continue;
             try emitBlankBefore(w, options, first);
             try w.writeByte('[');
@@ -278,7 +341,9 @@ fn encodeSection(
             try w.writeAll(" \"");
             try writeSubsectionLiteral(w, e.key);
             try w.writeAll("\"]\n");
-            for (e.value.section.entries) |leaf| {
+            var leaves = EntryOrder{ .entries = e.value.section.entries, .sort_keys = options.sort_keys };
+            while (leaves.next()) |li| {
+                const leaf = e.value.section.entries[li];
                 switch (leaf.value) {
                     .string => |s| try emitKv(w, leaf.key, s, options),
                     .list => |items| try emitList(w, leaf.key, items, options),
@@ -293,7 +358,9 @@ fn encodeSection(
         try w.writeByte('[');
         try w.writeAll(name);
         try w.writeAll("]\n");
-        for (sec.entries) |e| {
+        var it = EntryOrder{ .entries = sec.entries, .sort_keys = options.sort_keys };
+        while (it.next()) |i| {
+            const e = sec.entries[i];
             switch (e.value) {
                 .string => |s| try emitKv(w, e.key, s, options),
                 .list => |items| try emitList(w, e.key, items, options),
@@ -1472,4 +1539,135 @@ test "totality: encodeTyped compiles over ?T/??T/???T field surface" {
     }) |cfg| {
         try encodeTolerant(cfg, a);
     }
+}
+
+// sort_keys
+
+test "sort_keys: default preserves insertion order, true sorts ascending within a section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(Entry, 3);
+    entries[0] = .{ .key = "zeta", .value = .{ .string = "1" } };
+    entries[1] = .{ .key = "alpha", .value = .{ .string = "2" } };
+    entries[2] = .{ .key = "mid", .value = .{ .string = "3" } };
+    const sec = try a.create(Section);
+    sec.* = .{ .entries = entries };
+    const outer = try a.alloc(Entry, 1);
+    outer[0] = .{ .key = "s", .value = .{ .section = sec } };
+    const root = try a.create(Section);
+    root.* = .{ .entries = outer };
+    const v = Value{ .section = root };
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try encode(&aw.writer, v, .{ .dialect = Dialect.strict });
+    try testing.expectEqualStrings("[s]\nzeta = 1\nalpha = 2\nmid = 3\n", aw.written());
+
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    try encode(&aw2.writer, v, .{ .dialect = Dialect.strict, .sort_keys = true });
+    try testing.expectEqualStrings("[s]\nalpha = 2\nmid = 3\nzeta = 1\n", aw2.written());
+}
+
+test "sort_keys: sections themselves sort ascending by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zeta_entries = try a.alloc(Entry, 1);
+    zeta_entries[0] = .{ .key = "k", .value = .{ .string = "z" } };
+    const zeta = try a.create(Section);
+    zeta.* = .{ .entries = zeta_entries };
+
+    const alpha_entries = try a.alloc(Entry, 1);
+    alpha_entries[0] = .{ .key = "k", .value = .{ .string = "a" } };
+    const alpha = try a.create(Section);
+    alpha.* = .{ .entries = alpha_entries };
+
+    const outer = try a.alloc(Entry, 2);
+    outer[0] = .{ .key = "zeta", .value = .{ .section = zeta } };
+    outer[1] = .{ .key = "alpha", .value = .{ .section = alpha } };
+    const root = try a.create(Section);
+    root.* = .{ .entries = outer };
+    const v = Value{ .section = root };
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try encode(&aw.writer, v, .{ .dialect = Dialect.strict, .sort_keys = true, .blank_line_between_sections = false });
+    try testing.expectEqualStrings("[alpha]\nk = a\n[zeta]\nk = z\n", aw.written());
+}
+
+test "sort_keys: byte-lexicographic order (uppercase sorts before lowercase)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(Entry, 2);
+    entries[0] = .{ .key = "a", .value = .{ .string = "1" } };
+    entries[1] = .{ .key = "A", .value = .{ .string = "2" } };
+    const sec = try a.create(Section);
+    sec.* = .{ .entries = entries };
+    const outer = try a.alloc(Entry, 1);
+    outer[0] = .{ .key = "s", .value = .{ .section = sec } };
+    const root = try a.create(Section);
+    root.* = .{ .entries = outer };
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try encode(&aw.writer, .{ .section = root }, .{ .dialect = Dialect.strict, .sort_keys = true });
+    try testing.expectEqualStrings("[s]\nA = 2\na = 1\n", aw.written());
+}
+
+test "sort_keys: gitconfig subsections and their leaves sort recursively" {
+    const G = Dialect.gitconfig;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zeta_leaf = try a.alloc(Entry, 2);
+    zeta_leaf[0] = .{ .key = "url", .value = .{ .string = "z" } };
+    zeta_leaf[1] = .{ .key = "fetch", .value = .{ .string = "zf" } };
+    const zeta_sec = try a.create(Section);
+    zeta_sec.* = .{ .entries = zeta_leaf };
+
+    const alpha_leaf = try a.alloc(Entry, 1);
+    alpha_leaf[0] = .{ .key = "url", .value = .{ .string = "a" } };
+    const alpha_sec = try a.create(Section);
+    alpha_sec.* = .{ .entries = alpha_leaf };
+
+    const remote_entries = try a.alloc(Entry, 2);
+    remote_entries[0] = .{ .key = "zeta", .value = .{ .section = zeta_sec } };
+    remote_entries[1] = .{ .key = "alpha", .value = .{ .section = alpha_sec } };
+    const remote = try a.create(Section);
+    remote.* = .{ .entries = remote_entries };
+
+    const outer = try a.alloc(Entry, 1);
+    outer[0] = .{ .key = "remote", .value = .{ .section = remote } };
+    const root = try a.create(Section);
+    root.* = .{ .entries = outer };
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try encode(&aw.writer, .{ .section = root }, .{ .dialect = G, .indent = "\t", .sort_keys = true, .blank_line_between_sections = false });
+    try testing.expectEqualStrings(
+        "[remote \"alpha\"]\n\turl = a\n[remote \"zeta\"]\n\tfetch = zf\n\turl = z\n",
+        aw.written(),
+    );
+}
+
+test "sort_keys: encodeTyped sorts fields by emitted (post-rename) key, default keeps declaration order" {
+    const Cfg = struct {
+        zeta: []const u8,
+        alpha: []const u8,
+        renamed: []const u8,
+
+        pub const ini_rename = .{ .renamed = "aaa_first" };
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Cfg{ .zeta = "z", .alpha = "a", .renamed = "r" };
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try encodeTyped(&aw.writer, cfg, a, .{ .dialect = Dialect.generic });
+    try testing.expectEqualStrings("zeta = z\nalpha = a\naaa_first = r\n", aw.written());
+
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    try encodeTyped(&aw2.writer, cfg, a, .{ .dialect = Dialect.generic, .sort_keys = true });
+    try testing.expectEqualStrings("aaa_first = r\nalpha = a\nzeta = z\n", aw2.written());
 }

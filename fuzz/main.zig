@@ -46,6 +46,14 @@ const RoundTripFail = enum {
     mismatch,
 };
 
+// Reason a sort_keys stability check failed.
+const SortStableFail = enum {
+    encode1_failed,
+    reparse_failed,
+    encode2_failed,
+    mismatch,
+};
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const arena_alloc = init.arena.allocator();
@@ -128,6 +136,13 @@ pub fn main(init: std.process.Init) !u8 {
                 const probe = ini.parse(arena_probe.allocator(), input, .{ .dialect = d }) catch continue;
                 _ = probe;
                 any_parsed_ok = true;
+            }
+
+            // sort_keys stability: encode(sort_keys=true) is a fixed point under
+            // re-parse -> re-encode(sort_keys=true).
+            if (try fuzzSortStable(gpa, input, d)) |fail| {
+                failures += 1;
+                try reportSortStableFailure(w, n, seed, input, d, fail);
             }
         }
         if (any_parsed_ok) parsed_ok += 1;
@@ -256,6 +271,65 @@ fn fuzzRoundTrip(gpa: std.mem.Allocator, input: []const u8, d: Dialect) !?RoundT
 
 fn reportFailure(w: *Io.Writer, iter: usize, seed: u64, input: []const u8, d: Dialect, fail: RoundTripFail) !void {
     try w.print("FAIL iter={d} seed={d} dialect={s} fail={t} input_len={d}\n", .{
+        iter, seed, dialectName(d), fail, input.len,
+    });
+    try w.print("input (escaped): \"", .{});
+    for (input) |b| switch (b) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => if (b >= 0x20 and b < 0x7f) try w.writeByte(b) else try w.print("\\x{x:0>2}", .{b}),
+    };
+    try w.writeAll("\"\n");
+    try w.flush();
+}
+
+// Sort stability: for safe-encode dialects, encode(sort_keys=true) must be a
+// fixed point under re-parse -> re-encode(sort_keys=true). This is not a
+// round-trip of the original value (sort_keys deliberately reorders it) -- it
+// checks that sorting an already-sorted tree changes nothing.
+// Returns null when the invariant holds (or the initial parse/encode is
+// skipped for an expected reason), or a SortStableFail identifying where the
+// cycle broke.
+fn fuzzSortStable(gpa: std.mem.Allocator, input: []const u8, d: Dialect) !?SortStableFail {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const v1 = ini.parse(arena.allocator(), input, .{ .dialect = d }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+
+    var aw1: Io.Writer.Allocating = .init(gpa);
+    defer aw1.deinit();
+    ini.encode(&aw1.writer, v1, .{ .dialect = d, .sort_keys = true }) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+        error.UnrepresentableValue => return null,
+        else => return .encode1_failed,
+    };
+
+    var arena2: std.heap.ArenaAllocator = .init(gpa);
+    defer arena2.deinit();
+    const v2 = ini.parse(arena2.allocator(), aw1.written(), .{ .dialect = d }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .reparse_failed,
+    };
+
+    var aw2: Io.Writer.Allocating = .init(gpa);
+    defer aw2.deinit();
+    ini.encode(&aw2.writer, v2, .{ .dialect = d, .sort_keys = true }) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return .encode2_failed,
+    };
+
+    if (!std.mem.eql(u8, aw1.written(), aw2.written())) return .mismatch;
+    return null;
+}
+
+fn reportSortStableFailure(w: *Io.Writer, iter: usize, seed: u64, input: []const u8, d: Dialect, fail: SortStableFail) !void {
+    try w.print("SORT-STABLE-FAIL iter={d} seed={d} dialect={s} fail={t} input_len={d}\n", .{
         iter, seed, dialectName(d), fail, input.len,
     });
     try w.print("input (escaped): \"", .{});
@@ -642,6 +716,42 @@ test "round-trip invariant (1000 iters, fixed seed)" {
                 }
                 std.debug.print("\n", .{});
                 return error.RoundTripInvariantBroken;
+            }
+        }
+    }
+}
+
+// Bounded regression test: exercises the sort_keys stability invariant under
+// zig build test. Fixed seed and 1000 iterations so it never hangs or OOMs.
+test "sort_keys stability invariant (1000 iters, fixed seed)" {
+    const gpa = std.testing.allocator;
+    const max_input = 512;
+    const iterations = 1000;
+
+    var prng: std.Random.DefaultPrng = .init(0x50a7_5eed_1234_5678);
+    const rng = prng.random();
+
+    const input_buf = try gpa.alloc(u8, max_input);
+    defer gpa.free(input_buf);
+
+    var n: usize = 0;
+    while (n < iterations) : (n += 1) {
+        const len = rng.intRangeAtMost(usize, 0, max_input);
+        const input = input_buf[0..len];
+
+        if (rng.uintLessThan(u8, 4) < 3) {
+            rng.bytes(input);
+        } else {
+            generateBiased(rng, input);
+        }
+
+        for (roundtrip_dialects) |d| {
+            if (try fuzzSortStable(gpa, input, d)) |fail| {
+                std.debug.print(
+                    "sort_keys stability FAIL at iter {d} dialect={s} fail={t} input_len={d}\n",
+                    .{ n, dialectName(d), fail, input.len },
+                );
+                return error.SortStabilityInvariantBroken;
             }
         }
     }

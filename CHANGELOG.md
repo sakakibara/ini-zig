@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `EmitOptions.sort_keys`: opt-in, default `false`. When set, `encode` and
+  `encodeTyped` emit each section's key/value pairs, and the sections
+  themselves, in ascending byte-lexicographic order, recursively. Ordering
+  only, not canonicalization (not JCS): default output stays byte-for-byte
+  unchanged.
+
 ## [0.1.1] - 2026-07-05
 
 ### Fixed
