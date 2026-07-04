@@ -20,7 +20,7 @@ const Event = ini.Event;
 
 const corpus_root = conformance_options.corpus_path;
 
-// ----- flattening helpers -----
+// Flattening helpers
 
 // Flatten a buffered Value into ordered "path = value" lines.
 // Depth 0 -> section name (fold by case_insensitive_sections).
@@ -111,7 +111,7 @@ fn compareEventsVsBuffered(a: std.mem.Allocator, src: []const u8, d: Dialect, la
     }
 }
 
-// ----- chunked reader (arbitrary step size) -----
+// Chunked reader (arbitrary step size)
 
 const ChunkedReader = struct {
     src: []const u8,
@@ -257,7 +257,7 @@ fn runAll(a: std.mem.Allocator, src: []const u8, d: Dialect, label: []const u8) 
     try compareChunkStability(a, src, d, label);
 }
 
-// ----- corpus walk -----
+// Corpus walk
 
 fn dialectFor(name: []const u8) Dialect {
     if (std.mem.eql(u8, name, "generic")) return Dialect.generic;

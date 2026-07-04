@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // ---- streaming arm: large inputs exercise multi-pull framer resumption ----
+    // Streaming arm: large inputs exercise multi-pull framer resumption
     // Straddle sizes sweep a few bytes around each 4096-byte pull boundary;
     // the random bucket fills with inputs up to stream_max to cover long runs.
     const stream_max: usize = 16_384;
@@ -317,7 +317,7 @@ fn sectionEql(a: *Section, b: *Section) bool {
     return true;
 }
 
-// -------- streaming arm --------
+// Streaming arm
 
 // A std.Io.Reader that delivers at most `step` bytes per read, for driving the
 // framer across maximally-split pull boundaries.
