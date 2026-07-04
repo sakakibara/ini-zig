@@ -28,7 +28,7 @@ pub fn main() !void {
     _ = v;
 
     if (spans.get("server.port")) |span| {
-        const raw = src[span.start..span.end];
+        const raw = src[@intCast(span.start)..@intCast(span.end)];
         const port_val = std.fmt.parseInt(u32, raw, 10) catch 0;
         if (port_val > 65535) {
             // line/col are derived on demand from the byte offset and source.

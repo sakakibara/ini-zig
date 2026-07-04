@@ -648,7 +648,7 @@ const Parser = struct {
     }
 
     fn lineContent(self: *Parser, token: Token) []const u8 {
-        return self.src[token.span.start..token.span.end];
+        return self.src[@intCast(token.span.start)..@intCast(token.span.end)];
     }
 
     fn fail(self: *Parser, err: Error, span: Span, message: []const u8) Error {
