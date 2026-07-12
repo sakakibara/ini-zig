@@ -56,11 +56,12 @@ model, reader-backed streaming, and diagnostics.
 - Byte-precise source spans (opt-in via `ParseOptions.spans`): each span is
   a `{ start, end }` pair of `u64` byte offsets addressing inputs of any
   size, keyed by dotted path. Derive 1-indexed line/column on demand with
-  `Span.lineCol(src)`; `Diagnostic.format` takes the source bytes to render
+  `Span.lineCol(src)`; `Diagnostic.render` takes the source bytes to render
   location.
 - Multi-error diagnostics: one pass collects every parse error with recovery,
-  rendered one-line or rustc-style via `Diagnostic.formatRich` with
-  "did you mean" suggestions driven by Levenshtein distance.
+  rendered one-line via `Diagnostic.render` or rustc-style via
+  `Diagnostic.renderRich`, with "did you mean" suggestions driven by
+  Levenshtein distance.
 - Conformance: an authored multi-dialect corpus (`tests/corpus/`) covers
   generic, gitconfig, systemd, and windows fixture families; the corpus is
   enforced in `zig build test`. A differential harness
