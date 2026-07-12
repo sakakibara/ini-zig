@@ -320,8 +320,7 @@ matching `GetPrivateProfileString` behavior. An unbalanced or single quote is ke
 
 ### Annotation-driven decode and encode
 
-Structs opt into wire-format control with comptime declarations, mirroring
-the sibling libraries:
+Structs opt into wire-format control with comptime declarations:
 
 ```zig
 const Config = struct {
