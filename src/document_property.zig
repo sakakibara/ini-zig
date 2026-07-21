@@ -530,13 +530,15 @@ fn guaranteedFreshPath(a: std.mem.Allocator, ctr: *usize) ![]const []const u8 {
 /// `list_model` already occupies. `genPath`'s "fresh key" branches pick a
 /// key name (via `candidateName`, including the small fixed adversarial
 /// pool) with no knowledge of `list_model` -- which only `checkListValue`
-/// consults -- so an unguarded call could coincidentally collide with a
-/// genuine multi-value key already planted in the source. That matters here
-/// specifically because `runCase`'s SCALAR flow (`setSegments`) is not
-/// equipped to fully collapse an existing multi-value key to one line (only
-/// `setValueSegments` is); it would just splice the LAST occurrence in
-/// place, leaving the key a shorter list instead of the scalar `runCase`
-/// expects.
+/// (and `checkScalarCollapseOfList`) consult -- so an unguarded call could
+/// coincidentally collide with a genuine multi-value key already planted in
+/// the source. That matters here specifically because `runCase`'s invariant
+/// 5b (a byte-exact-except-value minimal diff, computed from the single span
+/// `ini.Spans` stores for the key) assumes a plain value-token splice; a
+/// multi-occurrence collapse touches several lines at once, which invariant
+/// 5b does not model -- same reason `checkListValue` skips 5b entirely for
+/// its own (also multi-line) list edits. `checkScalarCollapseOfList` is the
+/// dedicated check for this class instead.
 fn genPathAvoidingLists(
     a: std.mem.Allocator,
     rng: std.Random,
@@ -783,6 +785,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
     try checkResetToDistinctValue(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
     try checkListValue(a, dialect, dialect_name, gen, path, rng, idx, seed);
     try checkCrossKindReset(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
+    try checkScalarCollapseOfList(a, dialect, dialect_name, gen, rng, idx, seed);
 }
 
 /// Case-flip the section (index 0) and leaf key (the last index) of `path`,
@@ -1240,6 +1243,91 @@ fn checkListValue(
         if (!std.mem.eql(u8, out_after, gen.source)) {
             report(dialect_name, idx, seed, gen.source, path, items_desc, out_after, "list: failed edit did not roll back");
             return error.ListNotRolledBack;
+        }
+    }
+}
+
+/// `checkListValue`'s scalar counterpart, guarding the "scalar set on a
+/// multi-value key" collapse directly: picks a key genuinely planted in the
+/// source as a multi-value key (`gen.list_model`, several `key = item`
+/// lines) and sets it to a single scalar via `setValueSegments(.string, ...)`.
+/// Before the fix this spliced only the LAST occurrence in place, leaving the
+/// key a shorter list instead of a genuine scalar; the read-back check below
+/// (`got != .string`) catches that directly, and the line-count check pins
+/// down that EVERY other occurrence -- not just some -- was removed. Only
+/// meaningful under a `duplicate_keys = .accumulate` dialect (gitconfig
+/// here), same as `checkListValue`; a no-op when the source planted no
+/// multi-value key this run.
+fn checkScalarCollapseOfList(
+    a: std.mem.Allocator,
+    dialect: Dialect,
+    dialect_name: []const u8,
+    gen: GenResult,
+    rng: std.Random,
+    idx: usize,
+    seed: u64,
+) !void {
+    if (dialect.duplicate_keys != .accumulate) return;
+    if (gen.list_model.len == 0) return;
+    const e = gen.list_model[rng.uintLessThan(usize, gen.list_model.len)];
+    const path = e.segs[0..e.len];
+    const value = genTargetValue(rng);
+
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, path, value, null, "scalar-collapse: source failed to parse");
+        return err;
+    };
+
+    if (doc.setValueSegments(path, .{ .string = value })) |_| {
+        const out1 = try emitToOwned(a, &doc);
+        try assertCrlfPreserved(dialect_name, idx, seed, gen, path, value, out1, "CRLF source gained a bare LF (scalar-collapse)");
+
+        const reparsed = ini.parse(a, out1, .{ .dialect = dialect }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, path, value, out1, "scalar-collapse: output failed to reparse");
+            return err;
+        };
+
+        // Invariant 3: read-back exact -- a single scalar, not a shortened list.
+        const got = reparsed.getSegments(path) orelse {
+            report(dialect_name, idx, seed, gen.source, path, value, out1, "scalar-collapse: read-back missing");
+            return error.ScalarCollapseReadBackMissing;
+        };
+        if (got != .string or !std.mem.eql(u8, got.string, value)) {
+            report(dialect_name, idx, seed, gen.source, path, value, out1, "scalar-collapse: read-back is not the scalar value (key not fully collapsed)");
+            return error.ScalarCollapseReadBackMismatch;
+        }
+
+        // Every occurrence but the first is removed: net `e.items.len - 1`
+        // fewer lines than the source, nothing more and nothing less.
+        const before_lines = std.mem.count(u8, gen.source, "\n");
+        const after_lines = std.mem.count(u8, out1, "\n");
+        if (before_lines - after_lines != e.items.len - 1) {
+            report(dialect_name, idx, seed, gen.source, path, value, out1, "scalar-collapse: wrong number of lines removed");
+            return error.ScalarCollapseWrongLineCount;
+        }
+
+        // Invariant 4: sibling preservation (scalar and multi-value).
+        try checkListSiblings(dialect_name, idx, seed, gen, path, value, reparsed, out1, "scalar-collapse: sibling dropped or corrupted");
+
+        // Invariant 5: every comment survives, as a whole line.
+        try assertCommentsSurvive(a, dialect_name, idx, seed, gen, path, value, out1, "scalar-collapse: comment dropped");
+
+        // Invariant 6: idempotence.
+        doc.setValueSegments(path, .{ .string = value }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, path, value, out1, "scalar-collapse: idempotent re-apply errored");
+            return err;
+        };
+        const out2 = try emitToOwned(a, &doc);
+        if (!std.mem.eql(u8, out1, out2)) {
+            report(dialect_name, idx, seed, gen.source, path, value, out1, "scalar-collapse: not idempotent");
+            return error.ScalarCollapseNotIdempotent;
+        }
+    } else |_| {
+        // Invariant 1: set is total-or-clean.
+        const out_after = try emitToOwned(a, &doc);
+        if (!std.mem.eql(u8, out_after, gen.source)) {
+            report(dialect_name, idx, seed, gen.source, path, value, out_after, "scalar-collapse: failed edit did not roll back");
+            return error.ScalarCollapseNotRolledBack;
         }
     }
 }

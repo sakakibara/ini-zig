@@ -77,6 +77,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of a silent no-op that left the stale line in place. A path is
   now always tracked under exactly one kind, so a further re-set (of either
   kind) still finds and rewrites the same splice.
+- `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments` /
+  `setValueSegments` (`.string`): setting a scalar on a key that already has
+  several in-source occurrences (a multi-value key under an accumulating
+  dialect, e.g. a gitconfig multi-var like repeated `fetch =` lines) now
+  collapses the key to exactly that one value, at the first occurrence's
+  position, removing every other occurrence. Previously only the last
+  occurrence was spliced in place, leaving the key's other lines stale and
+  the read-back a list instead of the intended scalar. A key with a single
+  occurrence is unaffected.
 
 ## [0.3.0] - 2026-07-21
 

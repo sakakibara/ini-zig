@@ -316,7 +316,10 @@ pub const Document = struct {
     /// Set `segments` from an `ini.Value`, handling both a scalar and a
     /// multi-value (repeated-key) list:
     /// - `.string` behaves exactly like `setSegments` -- dialect-aware
-    ///   escaping, single value token.
+    ///   escaping, single value token. An existing key with several in-source
+    ///   occurrences (a multi-value key under an accumulate dialect)
+    ///   collapses to exactly that one line, at the first occurrence's
+    ///   position; every other occurrence is removed.
     /// - `.list` makes the key a multi-value key: after the call it is
     ///   backed by exactly one `key = item` line per element, in order,
     ///   each rendered the same dialect-aware way a scalar would be. An
@@ -368,7 +371,10 @@ pub const Document = struct {
     /// `.` verbatim, with no splitting, and is the shared core `set`/`setLiteral`
     /// (and their segment twins) route through.
     ///
-    /// An existing path is spliced exactly as `setLiteral` does today. A
+    /// An existing path is spliced exactly as `setLiteral` does today. When
+    /// the key has several in-source occurrences (a multi-value key under an
+    /// accumulate dialect), the first occurrence's value is spliced and every
+    /// other occurrence is removed, collapsing the key to that one line. A
     /// missing path is created and appended:
     /// - 1 segment: a root-level key, only when the dialect allows
     ///   `global_keys`; appended after the last existing global key, or at
@@ -398,6 +404,34 @@ pub const Document = struct {
         if (hasNewline(raw)) return error.UnrepresentableValue;
         if (escape.structureBreakingLiteral(self.options.dialect, raw)) return error.UnrepresentableValue;
         if (try self.locateSegments(segments)) |a| {
+            // `locateAllOccurrences` is consulted only to detect a genuine
+            // multi-occurrence key (several in-source physical lines): its
+            // structural container/key walk assumes `segments` names a real
+            // container-plus-key shape, which does not hold for the
+            // over-segmented dotted path `locateSegments` alone resolves via
+            // a raw dot-join match (see `C3` in the test suite below) -- so a
+            // structural miss here (`occurrences.len <= 1`) falls back to the
+            // single-splice behavior on `a`, unchanged from before this
+            // multi-occurrence handling existed.
+            const occurrences = try self.locateAllOccurrences(segments);
+            if (occurrences.len > 1) {
+                // A multi-occurrence key under an accumulate dialect (e.g. a
+                // gitconfig repeated `fetch =` line): a scalar set collapses
+                // it to exactly one line, at the FIRST occurrence's
+                // position, by reusing the same splice-group machinery
+                // `removeSegments` and the list path use to touch every
+                // occurrence atomically.
+                const first = occurrences[0];
+                var ops: std.ArrayList(SpliceOp) = .empty;
+                if (first.bare) {
+                    const graft = try std.fmt.allocPrint(self.arena, " {c} {s}", .{ self.assignChar(), raw });
+                    try ops.append(self.arena, .{ .start = first.key_end, .end = first.key_end, .text = graft });
+                } else {
+                    try ops.append(self.arena, .{ .start = first.value_start, .end = first.value_end, .text = raw });
+                }
+                for (occurrences[1..]) |occ| try ops.append(self.arena, .{ .start = occ.line_start, .end = occ.line_end, .text = "" });
+                return self.recordSpliceGroup(ops.items);
+            }
             if (a.bare) {
                 const graft = try std.fmt.allocPrint(self.arena, " {c} {s}", .{ self.assignChar(), raw });
                 return self.recordSplice(a.key_end, a.key_end, graft);
@@ -3279,4 +3313,95 @@ test "MULTIVAL: create then cross-kind then cross-kind-again collapses to the fi
     try testing.expectEqual(@as(usize, 2), list.len);
     try testing.expectEqualStrings("x", list[0]);
     try testing.expectEqualStrings("y", list[1]);
+}
+
+test "MULTIVAL: a scalar set on an in-source multi-value key collapses it to one line, via all three scalar entry points" {
+    const G = Dialect.gitconfig;
+    const src = "[remote \"origin\"]\n\tfetch = a\n\tfetch = b\n";
+
+    const Entry = enum { value_segments, set_segments, literal_segments };
+    const entries = [_]Entry{ .value_segments, .set_segments, .literal_segments };
+    for (entries) |entry| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        switch (entry) {
+            .value_segments => try doc.setValueSegments(&.{ "remote", "origin", "fetch" }, .{ .string = "a" }),
+            .set_segments => try doc.setSegments(&.{ "remote", "origin", "fetch" }, @as([]const u8, "a")),
+            .literal_segments => try doc.setLiteralSegments(&.{ "remote", "origin", "fetch" }, "a"),
+        }
+        const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+        try testing.expectEqualStrings("[remote \"origin\"]\n\tfetch = a\n", out);
+        const got = doc.getSegments(&.{ "remote", "origin", "fetch" }).?;
+        try testing.expect(got == .string);
+        try testing.expectEqualStrings("a", got.string);
+    }
+}
+
+test "MULTIVAL: a scalar set on a 3-occurrence key collapses to one line" {
+    const G = Dialect.gitconfig;
+    const src = "[remote \"o\"]\n\tpush = a\n\tpush = b\n\tpush = c\n\turl = u\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "remote", "o", "push" }, @as([]const u8, "only"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[remote \"o\"]\n\tpush = only\n\turl = u\n", out);
+    const got = doc.getSegments(&.{ "remote", "o", "push" }).?;
+    try testing.expect(got == .string);
+    try testing.expectEqualStrings("only", got.string);
+}
+
+test "MULTIVAL: a scalar set on a single-occurrence key stays byte-identical to the plain splice" {
+    const G = Dialect.gitconfig;
+    const src = "[remote \"o\"]\n\tpush = a\n\turl = u\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "remote", "o", "push" }, @as([]const u8, "z"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[remote \"o\"]\n\tpush = z\n\turl = u\n", out);
+}
+
+test "MULTIVAL: a source multi-value key set to a scalar can be set back to a list, round-tripping" {
+    const G = Dialect.gitconfig;
+    const src = "[remote \"origin\"]\n\tfetch = a\n\tfetch = b\n\turl = u\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setValueSegments(&.{ "remote", "origin", "fetch" }, .{ .string = "solo" });
+    const collapsed = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[remote \"origin\"]\n\tfetch = solo\n\turl = u\n", collapsed);
+
+    try doc.setValueSegments(&.{ "remote", "origin", "fetch" }, .{ .list = &.{ "x", "y" } });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[remote \"origin\"]\n\tfetch = x\n\tfetch = y\n\turl = u\n", out);
+    const list2 = doc.getSegments(&.{ "remote", "origin", "fetch" }).?.list;
+    try testing.expectEqual(@as(usize, 2), list2.len);
+    try testing.expectEqualStrings("x", list2[0]);
+    try testing.expectEqualStrings("y", list2[1]);
+}
+
+test "MULTIVAL: a scalar set on a multi-value key preserves a trailing comment and sibling keys byte-for-byte" {
+    const G = Dialect.gitconfig;
+    // The trailing comment sits on the FIRST occurrence -- the one that
+    // survives the collapse; the second occurrence (no comment) is removed
+    // outright, and both sibling keys must stay byte-for-byte untouched.
+    const src = "[remote \"o\"]\n\turl = u\n\tpush = a  ; keep\n\tpush = b\n\tother = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "remote", "o", "push" }, @as([]const u8, "solo"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(
+        "[remote \"o\"]\n\turl = u\n\tpush = solo  ; keep\n\tother = v\n",
+        out,
+    );
+    try testing.expectEqualStrings("u", doc.getSegments(&.{ "remote", "o", "url" }).?.string);
+    try testing.expectEqualStrings("v", doc.getSegments(&.{ "remote", "o", "other" }).?.string);
 }
