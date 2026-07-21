@@ -106,6 +106,14 @@ fn allSafeNames(path: []const []const u8) bool {
     return true;
 }
 
+/// True when `s` contains at least one ASCII letter -- digits have no case,
+/// so `caseFlip` is the identity on a digits-only name and cannot be relied
+/// on to produce a genuinely distinct path from it.
+fn hasAsciiLetter(s: []const u8) bool {
+    for (s) |c| if (c >= 'a' and c <= 'z') return true;
+    return false;
+}
+
 fn candidateName(a: std.mem.Allocator, rng: std.Random, ctr: *usize) ![]const u8 {
     if (rng.uintLessThan(u8, 100) < 35) {
         return adversarial_pool[rng.uintLessThan(usize, adversarial_pool.len)];
@@ -161,6 +169,28 @@ fn recordModel(a: std.mem.Allocator, model: *std.ArrayList(ModelEntry), segs: []
     try model.append(a, entry);
 }
 
+/// Drop any `model` entry at `path`, if one exists. `buildOneSection`'s
+/// per-call `uniqueName` only guards against a collision WITHIN that one
+/// call's own section; two different `buildOneSection` calls can still land
+/// on the same section name (`candidateName`'s adversarial pool is a small,
+/// unchecked-for-reuse set), and then independently pick the same key name
+/// for that shared section. When one call planted it as a scalar (`model`)
+/// and a later call plants the SAME path as a multi-value key (`list_model`),
+/// the real document ends up with just the list -- `recordListModel` always
+/// appends fresh -- so the stale scalar `model` entry must be dropped, or the
+/// sibling check (invariant 4) trips comparing it against the actual list.
+fn removeModelEntry(model: *std.ArrayList(ModelEntry), path: []const []const u8) void {
+    var i: usize = 0;
+    while (i < model.items.len) {
+        const e = model.items[i];
+        if (e.len == path.len and segsEqual(e.segs[0..e.len], path)) {
+            _ = model.swapRemove(i);
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn emitToOwned(a: std.mem.Allocator, doc: *const ini.Document) ![]const u8 {
     var aw: Io.Writer.Allocating = .init(a);
     try doc.emit(&aw.writer);
@@ -195,7 +225,24 @@ fn setAndRecord(
     return fallback;
 }
 
+/// `recordModel`'s list counterpart. Overwrites an existing same-path entry
+/// in place rather than blindly appending a second one -- needed for the
+/// same cross-call section-name-collision reason `removeModelEntry` exists
+/// (see `buildOneSection`'s comment): two different `buildOneSection` calls
+/// can land on the same section AND independently pick the same key name for
+/// its list branch, so the SECOND call's `setValueSegments` actually
+/// overwrites the FIRST call's already-planted lines in the real document
+/// (`locateAllOccurrences` finds them, since the container was promoted into
+/// `self.parsed` between calls). Without this dedup, `list_model` would keep
+/// the stale first-call entry alongside the current one, tripping a sibling
+/// check on a path having nothing to do with the edit under test.
 fn recordListModel(a: std.mem.Allocator, list_model: *std.ArrayList(ListModelEntry), segs: []const []const u8, items: []const []const u8) !void {
+    for (list_model.items) |*e| {
+        if (e.len == segs.len and segsEqual(e.segs[0..e.len], segs)) {
+            e.items = items;
+            return;
+        }
+    }
     var entry: ListModelEntry = .{ .segs = undefined, .len = segs.len, .items = items };
     for (segs, 0..) |s, i| entry.segs[i] = s;
     try list_model.append(a, entry);
@@ -278,7 +325,12 @@ fn buildOneSection(
         const actual = if (dialect.duplicate_keys == .accumulate and rng.uintLessThan(u8, 100) < 30) blk: {
             const items = try a.alloc([]const u8, rng.intRangeAtMost(usize, 2, 3));
             for (items) |*v| v.* = safeValue(rng);
-            break :blk try setAndRecordList(builder, a, list_model, segs, items, ctr);
+            const path = try setAndRecordList(builder, a, list_model, segs, items, ctr);
+            // See `removeModelEntry`: a same-named section from an EARLIER
+            // `buildOneSection` call may have already planted this exact
+            // path as a scalar.
+            removeModelEntry(model, path);
+            break :blk path;
         } else blk: {
             const value = safeValue(rng);
             break :blk try setAndRecord(builder, a, model, segs, value, ctr);
@@ -730,6 +782,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
     try checkCaseVariant(a, dialect, dialect_name, gen, rng, idx, seed);
     try checkResetToDistinctValue(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
     try checkListValue(a, dialect, dialect_name, gen, path, rng, idx, seed);
+    try checkCrossKindReset(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
 }
 
 /// Case-flip the section (index 0) and leaf key (the last index) of `path`,
@@ -769,7 +822,13 @@ fn checkCaseVariant(
     var candidates: std.ArrayList(usize) = .empty;
     for (gen.model, 0..) |e, i| {
         if (e.len < 2 or e.len > max_segments) continue;
-        if (allSafeNames(e.segs[0..e.len])) try candidates.append(a, i);
+        if (!allSafeNames(e.segs[0..e.len])) continue;
+        // `caseFlip` only ever flips segment 0 (section) and the last
+        // segment (leaf key); at least one of those needs a letter, or the
+        // "variant" is byte-identical to `canonical` and this degenerates
+        // into a same-path re-set instead of a genuinely distinct path.
+        if (!hasAsciiLetter(e.segs[0]) and !hasAsciiLetter(e.segs[e.len - 1])) continue;
+        try candidates.append(a, i);
     }
     if (candidates.items.len == 0) return;
     const e = gen.model[candidates.items[rng.uintLessThan(usize, candidates.items.len)]];
@@ -884,6 +943,124 @@ fn checkResetToDistinctValue(
     if (got != .string or !std.mem.eql(u8, got.string, "second")) {
         report(dialect_name, idx, seed, gen.source, path, "second", out, "reset-distinct: read-back is not the second value");
         return error.ResetToDistinctValueMismatch;
+    }
+}
+
+/// `checkResetToDistinctValue`'s cross-kind counterpart (guards A1): create a
+/// fresh path as one kind (scalar or list, chosen at random), then re-set the
+/// SAME path as the OTHER kind, twice in a row (so the path is tracked under
+/// each kind's map at least once). Only meaningful under a `duplicate_keys =
+/// .accumulate` dialect (gitconfig here), same as `checkListValue`.
+///
+/// The check: after EACH cross-kind re-set, the result must be BYTE-IDENTICAL
+/// to a document built by setting that same final value directly from
+/// `gen.source` in one shot. `Document` rebuilds a session-created path's
+/// splice in place using the ORIGINAL create's anchor (`leading`/`indent`/
+/// `key`), so a genuinely-collapsed cross-kind re-set can never differ from a
+/// fresh single create of the same final value; A1 (before the fix) instead
+/// left the prior kind's line(s) in place and appended the new kind's
+/// alongside them, which this byte-comparison catches directly -- no need to
+/// separately reason about line counts or duplicate content.
+fn checkCrossKindReset(
+    a: std.mem.Allocator,
+    dialect: Dialect,
+    dialect_name: []const u8,
+    gen: GenResult,
+    rng: std.Random,
+    ctr: *usize,
+    idx: usize,
+    seed: u64,
+) !void {
+    if (dialect.duplicate_keys != .accumulate) return;
+    const path = try genFreshPathAvoidingLists(a, rng, gen.list_model, dialect, ctr);
+
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, path, "", null, "cross-kind: source failed to parse");
+        return err;
+    };
+    const start_list = rng.boolean();
+    if (start_list) {
+        doc.setValueSegments(path, .{ .list = &.{ "cx1", "cx2" } }) catch return;
+    } else {
+        doc.setSegments(path, @as([]const u8, "cx0")) catch return;
+    }
+
+    // Flip kind twice: e.g. list -> scalar -> list (or the reverse if
+    // `start_list` began the other way), checked against a direct single
+    // create of that exact final value after each flip.
+    const Step = struct { list: bool, scalar_value: []const u8, list_items: []const []const u8 };
+    const steps = [_]Step{
+        .{ .list = !start_list, .scalar_value = "cx3", .list_items = &.{ "cx4", "cx5", "cx6" } },
+        .{ .list = start_list, .scalar_value = "cx7", .list_items = &.{"cx8"} },
+    };
+    for (steps) |step| {
+        if (step.list) {
+            doc.setValueSegments(path, .{ .list = step.list_items }) catch |err| {
+                report(dialect_name, idx, seed, gen.source, path, "", null, "cross-kind: list re-set errored");
+                return err;
+            };
+        } else {
+            doc.setSegments(path, step.scalar_value) catch |err| {
+                report(dialect_name, idx, seed, gen.source, path, step.scalar_value, null, "cross-kind: scalar re-set errored");
+                return err;
+            };
+        }
+        const out = try emitToOwned(a, &doc);
+        try assertCrlfPreserved(dialect_name, idx, seed, gen, path, step.scalar_value, out, "CRLF source gained a bare LF (cross-kind)");
+
+        var doc_direct = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, path, step.scalar_value, null, "cross-kind: direct-compare source failed to parse");
+            return err;
+        };
+        if (step.list) {
+            doc_direct.setValueSegments(path, .{ .list = step.list_items }) catch |err| {
+                report(dialect_name, idx, seed, gen.source, path, step.scalar_value, null, "cross-kind: direct list create errored");
+                return err;
+            };
+        } else {
+            doc_direct.setSegments(path, step.scalar_value) catch |err| {
+                report(dialect_name, idx, seed, gen.source, path, step.scalar_value, null, "cross-kind: direct scalar create errored");
+                return err;
+            };
+        }
+        const out_direct = try emitToOwned(a, &doc_direct);
+        if (!std.mem.eql(u8, out, out_direct)) {
+            report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: re-set differs from a direct single create of the same final value");
+            return error.CrossKindResetNotCollapsed;
+        }
+
+        const reparsed = ini.parse(a, out, .{ .dialect = dialect }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: output failed to reparse");
+            return err;
+        };
+        const got = reparsed.getSegments(path) orelse {
+            report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: read-back missing");
+            return error.CrossKindResetMissing;
+        };
+        if (step.list) {
+            if (step.list_items.len == 1) {
+                if (got != .string or !std.mem.eql(u8, got.string, step.list_items[0])) {
+                    report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: single-item list read-back mismatch");
+                    return error.CrossKindResetMismatch;
+                }
+            } else {
+                if (got != .list or got.list.len != step.list_items.len) {
+                    report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: list read-back mismatch");
+                    return error.CrossKindResetMismatch;
+                }
+                for (got.list, step.list_items) |g, w| {
+                    if (!std.mem.eql(u8, g, w)) {
+                        report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: list item mismatch");
+                        return error.CrossKindResetMismatch;
+                    }
+                }
+            }
+        } else {
+            if (got != .string or !std.mem.eql(u8, got.string, step.scalar_value)) {
+                report(dialect_name, idx, seed, gen.source, path, step.scalar_value, out, "cross-kind: scalar read-back mismatch");
+                return error.CrossKindResetMismatch;
+            }
+        }
     }
 }
 
