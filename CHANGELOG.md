@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `Document.setValueSegments`: set a path from an `ini.Value`, handling both
+  a `.string` scalar (dialect-aware escaping, identical to `setSegments`) and
+  a `.list` (a multi-value key, e.g. a gitconfig multi-var like
+  `remote.origin.fetch` with several refspecs). Setting a `.list` leaves the
+  key backed by exactly one `key = item` line per element, in order,
+  replacing however many lines it previously had; a missing key is created
+  the same way a scalar `set` creates one; an empty list removes the key's
+  lines entirely rather than leaving a valueless key behind (a bare
+  gitconfig key already means boolean-true, not "zero values"). `.section`
+  is `error.InvalidValue`.
+- `Document.removeSegments`: now removes EVERY physical line backing a
+  multi-value key (`duplicate_keys = .accumulate`, e.g. gitconfig), not just
+  the one line the parser's span map happens to still point at. Every other
+  dialect's behavior is unchanged.
+
 ### Fixed
 
 - `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments`:
