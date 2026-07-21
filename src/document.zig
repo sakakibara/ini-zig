@@ -11,6 +11,20 @@
 //!
 //! All allocations go through the arena passed to `parse`; releasing the arena
 //! frees everything. There is no `Document.deinit`.
+//!
+//! Setting a path whose section (or, under a subsection-quoting dialect, its
+//! subsection) does not exist creates it: a whole new `[section]` or
+//! `[section "subsection"]` header plus the key is appended at the end of
+//! the document, separated from prior content by one blank line. Setting a
+//! path whose section already exists just appends the key to it.
+//! `Document.empty` bootstraps a document with no source bytes at all, so
+//! the very first `set` creates the whole path. `setSegments` /
+//! `setLiteralSegments` / `removeSegments` take a path as pre-split segments
+//! instead of a dotted string, so a section or key name containing a literal
+//! `.` (e.g. a gitconfig subsection) is addressed unambiguously;
+//! `set`/`setLiteral`/`remove` still take dotted strings and split them into
+//! segments the same way before doing the same work, so a dot-free path
+//! behaves identically either way.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,12 +39,20 @@ const escape = @import("escape.zig");
 const escapeGit = escape.escapeGit;
 
 const Value = value_mod.Value;
+const Section = value_mod.Section;
 const Span = value_mod.Span;
 const Spans = value_mod.Spans;
 const Dialect = dialect_mod.Dialect;
 
 pub const DocumentError = error{
     PathNotFound,
+    /// A create-on-set path collides, in either direction, with a value of
+    /// the wrong kind: a container segment (all but the last of a path)
+    /// already names a string/list value instead of a section, so it cannot
+    /// be descended into or created under; or the leaf key already names a
+    /// section/subsection, so creating it as a scalar would silently shadow
+    /// that section on read instead.
+    InvalidValue,
     /// A value would not survive a re-parse after splicing: a carriage return
     /// (any dialect), an embedded newline or trimmed edge whitespace under a
     /// non-quoting dialect, or a continuation-swallowing trailing backslash.
@@ -118,6 +140,33 @@ pub const Document = struct {
         };
     }
 
+    /// Bootstrap a document with no source bytes at all, for a config layer
+    /// that may not exist on disk yet. Reads see nothing until the first
+    /// edit; the first `set`/`setSegments` (etc.) creates the whole
+    /// requested section and key in one splice.
+    ///
+    /// `Document.parse(arena, "", options)` already succeeds for INI (an
+    /// empty file is a valid, empty document, unlike a format that requires
+    /// a top-level value) and produces an equivalent empty document, so
+    /// `empty` is not a special case grafted onto `parse` -- it is a
+    /// dedicated, self-documenting entry point for "this file may not exist
+    /// yet" that skips invoking the parser entirely.
+    pub fn empty(arena: Allocator, options: parser_mod.ParseOptions) Allocator.Error!Document {
+        const root = try arena.create(Section);
+        root.* = .{ .entries = &.{} };
+        return .{
+            .arena = arena,
+            .source = "",
+            .bom = false,
+            .options = options,
+            .parsed = .{ .section = root },
+            .view = .{ .section = root },
+            .spans = .empty,
+            .splices = .empty,
+            .seq = 0,
+        };
+    }
+
     /// Look up a value by dotted path, reflecting any pending edits. Returns
     /// null if absent. A name containing `.` (a gitconfig subsection) is not
     /// addressable here; use `getSegments`.
@@ -146,10 +195,18 @@ pub const Document = struct {
 
     /// Set `path` to `value`, comptime-dispatched on its Zig type. Strings,
     /// bools, integers, and floats are rendered to INI text (escaped per the
-    /// dialect) and spliced over the existing value token.
+    /// dialect) and spliced over the existing value token, or used to create
+    /// the key (and its section, if missing) -- see `setLiteralSegments`.
     pub fn set(self: *Document, path: []const u8, value: anytype) DocumentError!void {
         const text = try self.renderTyped(@TypeOf(value), value);
         return self.setLiteral(path, text);
+    }
+
+    /// Segment-path counterpart of `set`: addresses a name containing `.`
+    /// (e.g. a gitconfig subsection) verbatim, with no splitting.
+    pub fn setSegments(self: *Document, segments: []const []const u8, value: anytype) DocumentError!void {
+        const text = try self.renderTyped(@TypeOf(value), value);
+        return self.setLiteralSegments(segments, text);
     }
 
     /// Splice `raw` verbatim over the value token at `path`. `raw` is NOT
@@ -160,29 +217,74 @@ pub const Document = struct {
     /// is rejected too. A value-level non-round-trip remains the caller's
     /// footgun; only document-structure breaks are refused. For a no-value key
     /// the literal is grafted as `<assign> raw`, turning it into a normal entry.
+    ///
+    /// When `path` is entirely absent, the key (and its section, or section
+    /// and subsection, if those are missing too) is created and appended --
+    /// see `setLiteralSegments` for the exact placement and formatting rules.
     pub fn setLiteral(self: *Document, path: []const u8, raw: []const u8) DocumentError!void {
-        if (std.mem.indexOfAny(u8, raw, "\n\r") != null) return error.UnrepresentableValue;
-        if (escape.structureBreakingLiteral(self.options.dialect, raw)) return error.UnrepresentableValue;
-        const a = self.locate(path) orelse return error.PathNotFound;
-        if (a.bare) {
-            const graft = try std.fmt.allocPrint(self.arena, " {c} {s}", .{ self.assignChar(), raw });
-            return self.recordSplice(a.key_end, a.key_end, graft);
-        }
-        try self.recordSplice(a.value_start, a.value_end, raw);
+        return self.setLiteralSegments(try self.segmentsFromPath(path), raw);
     }
 
-    /// Delete the whole line containing `path`.
+    /// Segment-path counterpart of `setLiteral`: addresses a name containing
+    /// `.` verbatim, with no splitting, and is the shared core `set`/`setLiteral`
+    /// (and their segment twins) route through.
+    ///
+    /// An existing path is spliced exactly as `setLiteral` does today. A
+    /// missing path is created and appended:
+    /// - 1 segment: a root-level key, only when the dialect allows
+    ///   `global_keys`; appended after the last existing global key, or at
+    ///   the very start of the document if there are none yet.
+    /// - 2 segments: `section.key`. An existing `[section]` gets the key
+    ///   appended after its last entry (or right after its header, if the
+    ///   section is empty); a missing `[section]` is appended as a whole new
+    ///   section at the end of the document.
+    /// - 3 segments: `section.subsection.key`, only when the dialect quotes
+    ///   subsections. A missing subsection is always a whole new
+    ///   `[section "subsection"]` header (gitconfig has no header syntax for
+    ///   "add a subsection to an existing section block"), appended at the
+    ///   end of the document exactly like a missing plain section.
+    ///
+    /// A brand-new section/subsection is separated from prior content by
+    /// exactly one blank line (none if the document is empty). A newly
+    /// appended key's indentation mirrors an existing sibling in the same
+    /// section; with no sibling to mirror (a fresh or still-empty section),
+    /// it mirrors the first indented key anywhere else in the document, or
+    /// is unindented if there is none.
+    ///
+    /// Any other segment count is `error.PathNotFound` (over-deep for this
+    /// dialect's section/subsection/key shape). A container segment that
+    /// resolves to an existing string/list value (not a section) is
+    /// `error.InvalidValue`. `raw` is validated exactly as in `setLiteral`.
+    pub fn setLiteralSegments(self: *Document, segments: []const []const u8, raw: []const u8) DocumentError!void {
+        if (hasNewline(raw)) return error.UnrepresentableValue;
+        if (escape.structureBreakingLiteral(self.options.dialect, raw)) return error.UnrepresentableValue;
+        if (try self.locateSegments(segments)) |a| {
+            if (a.bare) {
+                const graft = try std.fmt.allocPrint(self.arena, " {c} {s}", .{ self.assignChar(), raw });
+                return self.recordSplice(a.key_end, a.key_end, graft);
+            }
+            return self.recordSplice(a.value_start, a.value_end, raw);
+        }
+        return self.insertSegments(segments, raw);
+    }
+
+    /// Delete the whole line containing `path`. Never creates.
     pub fn remove(self: *Document, path: []const u8) DocumentError!void {
-        const a = self.locate(path) orelse return error.PathNotFound;
+        return self.removeSegments(try self.segmentsFromPath(path));
+    }
+
+    /// Segment-path counterpart of `remove`. Never creates.
+    pub fn removeSegments(self: *Document, segments: []const []const u8) DocumentError!void {
+        const a = try self.locateSegments(segments) orelse return error.PathNotFound;
         try self.recordSplice(a.line_start, a.line_end, "");
     }
 
     /// Insert a comment line immediately before the line containing `path`.
     /// The leading whitespace of the target line is mirrored; the comment
-    /// character and a trailing newline are added automatically.
+    /// character and a trailing newline are added automatically. Never creates.
     pub fn addCommentBefore(self: *Document, path: []const u8, text: []const u8) DocumentError!void {
         if (hasNewline(text)) return error.InvalidComment;
-        const a = self.locate(path) orelse return error.PathNotFound;
+        const a = try self.locate(path) orelse return error.PathNotFound;
         const line = try std.fmt.allocPrint(self.arena, "{s}{c} {s}\n", .{ a.indent, self.commentChar(), text });
         try self.recordSplice(a.line_start, a.line_start, line);
     }
@@ -193,11 +295,11 @@ pub const Document = struct {
     /// that strips inline comments; otherwise the appended bytes would re-parse
     /// as value text, so the call is refused. A no-value key is first grafted
     /// with an empty value (`<assign>`) so the comment attaches without
-    /// clobbering the key.
+    /// clobbering the key. Never creates.
     pub fn setTrailingComment(self: *Document, path: []const u8, text: []const u8) DocumentError!void {
         if (!self.options.dialect.inline_comments) return error.CommentsNotSupported;
         if (hasNewline(text)) return error.InvalidComment;
-        const a = self.locate(path) orelse return error.PathNotFound;
+        const a = try self.locate(path) orelse return error.PathNotFound;
         if (a.bare) {
             const graft = try std.fmt.allocPrint(self.arena, " {c}  {c} {s}", .{ self.assignChar(), self.commentChar(), text });
             return self.recordSplice(a.key_end, a.key_end, graft);
@@ -221,8 +323,37 @@ pub const Document = struct {
         try w.writeAll(self.source[pos..]);
     }
 
-    fn locate(self: *const Document, path: []const u8) ?Anchors {
-        const span = self.spans.get(path) orelse return null;
+    /// Resolve `path` to its `Anchors`, splitting it into segments the same
+    /// way `PathIterator` always has. `null` when the path does not resolve;
+    /// allocation failure propagates (building the segment list allocates).
+    fn locate(self: *const Document, path: []const u8) DocumentError!?Anchors {
+        return self.locateSegments(try self.segmentsFromPath(path));
+    }
+
+    /// Segment-path counterpart of `locate`: resolve explicit segments (no
+    /// splitting) to their `Anchors` by looking up the same dot-joined key
+    /// `recordSpan` stores (so a name containing `.` is addressable, matching
+    /// `Section.locateSegments`).
+    fn locateSegments(self: *const Document, segments: []const []const u8) DocumentError!?Anchors {
+        if (segments.len == 0) return null;
+        const joined = try std.mem.join(self.arena, ".", segments);
+        const span = self.spans.get(joined) orelse return null;
+        return self.anchorsForSpan(span);
+    }
+
+    /// Split a dotted string path into arena-owned segments, exactly as
+    /// `Section.get` splits one for navigation.
+    fn segmentsFromPath(self: *const Document, path: []const u8) Allocator.Error![]const []const u8 {
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = value_mod.PathIterator{ .rest = path };
+        while (it.next()) |seg| try list.append(self.arena, seg);
+        return list.items;
+    }
+
+    /// Compute the full set of byte anchors for a value at `span`. Shared by
+    /// `locateSegments` (an existing path) and the create-missing-key paths,
+    /// which anchor off a sibling entry's span the same way.
+    fn anchorsForSpan(self: *const Document, span: Span) Anchors {
         const src = self.source;
         const dialect = self.options.dialect;
         // u64 span offsets index an in-memory buffer, so they fit usize.
@@ -257,6 +388,236 @@ pub const Document = struct {
             .bare = bare,
             .key_end = key_end,
         };
+    }
+
+    /// Deepest segment count this dialect's header shape can express: section
+    /// + quoted subsection + key when subsections are quoted, else section +
+    /// key. A single-segment path (a root-level key) is representable only
+    /// when the dialect allows `global_keys`, checked separately.
+    fn maxDepth(self: *const Document) usize {
+        return if (self.options.dialect.subsections == .quoted) 3 else 2;
+    }
+
+    /// Resolve every segment but the last (the section, or section and
+    /// subsection) against the ORIGINAL parse. `null` when that container is
+    /// entirely or partially missing (create it); `error.InvalidValue` when a
+    /// segment along the way already names a string/list value instead of a
+    /// section (can neither be descended into nor created under).
+    fn resolveContainer(self: *const Document, container: []const []const u8) error{InvalidValue}!?*Section {
+        var cur: *Section = self.parsed.section;
+        for (container) |seg| {
+            const val = cur.findValue(seg) orelse return null;
+            if (val != .section) return error.InvalidValue;
+            cur = val.section;
+        }
+        return cur;
+    }
+
+    /// Create and append the key (and its section/subsection, if missing)
+    /// named by `segments`. Called only after `locateSegments` has already
+    /// missed, so `segments` is known not to resolve today.
+    fn insertSegments(self: *Document, segments: []const []const u8, raw: []const u8) DocumentError!void {
+        const max_depth = self.maxDepth();
+        if (segments.len == 0 or segments.len > max_depth) return error.PathNotFound;
+        const key = segments[segments.len - 1];
+        try self.validateKeyText(key);
+
+        if (segments.len == 1) {
+            if (!self.options.dialect.global_keys) return error.PathNotFound;
+            // A root-level `.section` entry (an existing `[key]` header) of the
+            // same name would otherwise be silently shadowed by the new global
+            // key, since both share the root entries list but never dedupe
+            // against each other. A scalar collision can't reach here: it
+            // would already have been found (and handled) by `locateSegments`.
+            if (self.parsed.section.findValue(key)) |existing| {
+                if (existing == .section) return error.InvalidValue;
+            }
+            return self.insertGlobalKey(key, raw);
+        }
+
+        const container = segments[0 .. segments.len - 1];
+        try self.validateSectionName(container[0]);
+        if (container.len == 2) try validateSubsectionName(container[1]);
+
+        if (try self.resolveContainer(container)) |section| {
+            // Same shadowing guard, one level down: `key` may already name a
+            // subsection within `section` (only possible when `container` is
+            // the top-level section, since a subsection's own entries are
+            // always scalars).
+            if (section.findValue(key)) |existing| {
+                if (existing == .section) return error.InvalidValue;
+            }
+            return self.insertKeyIntoSection(container, section, key, raw);
+        }
+        return self.appendNewSection(container, key, raw);
+    }
+
+    /// Append a root-level (global) key: after the last existing global key,
+    /// or at the very start of the document if there are none (global keys
+    /// must precede every section header). Unindented.
+    fn insertGlobalKey(self: *Document, key: []const u8, raw: []const u8) DocumentError!void {
+        var last_key: ?[]const u8 = null;
+        for (self.parsed.section.entries) |e| {
+            if (e.value == .section) break;
+            last_key = e.key;
+        }
+        var at: usize = 0;
+        if (last_key) |lk| {
+            const a = self.anchorsForSpan(self.spans.get(lk).?);
+            at = a.line_end;
+        }
+        const line = try std.fmt.allocPrint(self.arena, "{s}{s} {c} {s}\n", .{
+            leadingNewlineIfNeeded(self.source, at), key, self.assignChar(), raw,
+        });
+        return self.recordSplice(at, at, line);
+    }
+
+    /// Append `key` into an already-resolved, existing `section`: after its
+    /// last SCALAR entry (mirroring that entry's indentation) -- a top-level
+    /// section's entries may mix scalars with subsections (e.g. a bare
+    /// `[branch]` block followed by `[branch "main"]`), and only a scalar
+    /// entry has a span to anchor on. With no scalar entry, falls back to
+    /// right after the section's own bare header line (mirroring the first
+    /// indented key found anywhere else in the document, if any); with no
+    /// bare header line either (a top-level section that exists only as
+    /// `[section "sub"]` blocks), falls back to appending a whole new bare
+    /// section, same as a genuinely missing one.
+    fn insertKeyIntoSection(
+        self: *Document,
+        container: []const []const u8,
+        section: *Section,
+        key: []const u8,
+        raw: []const u8,
+    ) DocumentError!void {
+        var at: usize = undefined;
+        var indent: []const u8 = undefined;
+        if (lastScalarKey(section)) |last_key| {
+            const joined = try std.mem.join(self.arena, ".", container);
+            const full = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ joined, last_key });
+            const a = self.anchorsForSpan(self.spans.get(full).?);
+            at = a.line_end;
+            indent = a.indent;
+        } else if (self.headerLineEnd(container)) |end| {
+            at = end;
+            indent = self.prevailingIndent();
+        } else {
+            return self.appendNewSection(container, key, raw);
+        }
+        const line = try std.fmt.allocPrint(self.arena, "{s}{s}{s} {c} {s}\n", .{
+            leadingNewlineIfNeeded(self.source, at), indent, key, self.assignChar(), raw,
+        });
+        return self.recordSplice(at, at, line);
+    }
+
+    /// Key of the last entry in `section` that is a scalar (string/list), not
+    /// a nested subsection, or null if it has none. Scans backward since a
+    /// mixed section (rare, but valid: a bare `[branch]` block followed later
+    /// by `[branch "main"]`) always has its subsection entries trailing its
+    /// own direct keys in file order.
+    fn lastScalarKey(section: *const Section) ?[]const u8 {
+        var i = section.entries.len;
+        while (i > 0) {
+            i -= 1;
+            if (section.entries[i].value != .section) return section.entries[i].key;
+        }
+        return null;
+    }
+
+    /// Append a whole new section (or `[section "subsection"]`) plus its one
+    /// key at the end of the document, separated from prior content by
+    /// exactly one blank line (none if the document is empty). This is the
+    /// only place a header line is created, so a subsection is always a full
+    /// new header -- gitconfig has no syntax for adding a subsection to an
+    /// existing `[section]` block.
+    fn appendNewSection(self: *Document, container: []const []const u8, key: []const u8, raw: []const u8) DocumentError!void {
+        const header = if (container.len == 2) blk: {
+            const sub = try escapeSubsectionName(self.arena, container[1]);
+            break :blk try std.fmt.allocPrint(self.arena, "[{s} \"{s}\"]\n", .{ container[0], sub });
+        } else try std.fmt.allocPrint(self.arena, "[{s}]\n", .{container[0]});
+        const text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}{s} {c} {s}\n", .{
+            newSectionSeparator(self.source), header, self.prevailingIndent(), key, self.assignChar(), raw,
+        });
+        return self.recordSplice(self.source.len, self.source.len, text);
+    }
+
+    /// Byte offset just past the source line of the first header matching
+    /// `container` (1 name, or 2 for a quoted subsection), or null if none is
+    /// found. Used only to anchor a key appended into a section/subsection
+    /// that exists but has zero entries, where no entry span is available.
+    /// Reuses the real tokenizer and header splitter so this always agrees
+    /// with how `self.parsed` itself read the file.
+    fn headerLineEnd(self: *const Document, container: []const []const u8) ?usize {
+        const d = self.options.dialect;
+        var tz = tok.Tokenizer.init(self.source, d);
+        while (tz.next()) |t| {
+            if (t.kind != .section_header) continue;
+            const raw = self.source[@intCast(t.span.start)..@intCast(t.span.end)];
+            const parts = parser_mod.splitHeader(raw, d) catch continue;
+            const name_matches = if (d.case_insensitive_sections)
+                std.ascii.eqlIgnoreCase(parts.name, container[0])
+            else
+                std.mem.eql(u8, parts.name, container[0]);
+            if (!name_matches) continue;
+            if (container.len == 2) {
+                const raw_sub = parts.subsection orelse continue;
+                const sub = escape.unescapeSubsection(self.arena, raw_sub) catch continue;
+                if (!std.mem.eql(u8, sub, container[1])) continue;
+            } else if (parts.subsection != null) {
+                continue;
+            }
+            return tz.pos;
+        }
+        return null;
+    }
+
+    /// Indentation of the first key/value line anywhere in the document, or
+    /// "" if there are none. Used to pick an indent for a freshly created key
+    /// with no local sibling to mirror.
+    fn prevailingIndent(self: *const Document) []const u8 {
+        var tz = tok.Tokenizer.init(self.source, self.options.dialect);
+        while (tz.next()) |t| {
+            if (t.kind != .key_value) continue;
+            return indentOf(self.source, @intCast(t.span.start));
+        }
+        return "";
+    }
+
+    /// Reject a key that would not survive a re-parse as the SAME key: empty,
+    /// a line break, containing an assign char (would truncate it early),
+    /// edge whitespace under a trimming dialect, or a leading byte that would
+    /// misclassify the line as a comment or section header.
+    fn validateKeyText(self: *const Document, key: []const u8) DocumentError!void {
+        if (key.len == 0) return error.EmptyKey;
+        if (hasNewline(key)) return error.UnrepresentableValue;
+        const d = self.options.dialect;
+        if (std.mem.indexOfAny(u8, key, d.assign_chars) != null) return error.UnrepresentableValue;
+        if (d.trim_whitespace and edgeWhitespace(key)) return error.UnrepresentableValue;
+        if (std.mem.indexOfScalar(u8, d.comment_chars, key[0]) != null) return error.UnrepresentableValue;
+        if (key[0] == '[') return error.UnrepresentableValue;
+        if (d.quoting == .git and !parser_mod.validGitKey(key)) return error.InvalidKey;
+    }
+
+    /// Reject a section (or plain, non-subsection header) name that would not
+    /// survive a re-parse as the SAME name: empty, a line break, edge
+    /// whitespace (a quoted-subsection header always trims the outer name,
+    /// regardless of `trim_section_names`), an embedded `"` under a
+    /// subsection-quoting dialect (would be misread as opening a subsection),
+    /// or an invalid git section-name charset.
+    fn validateSectionName(self: *const Document, name: []const u8) DocumentError!void {
+        if (name.len == 0) return error.MalformedSectionHeader;
+        if (hasNewline(name)) return error.UnrepresentableValue;
+        if (edgeWhitespace(name)) return error.UnrepresentableValue;
+        const d = self.options.dialect;
+        if (d.subsections == .quoted and std.mem.indexOfScalar(u8, name, '"') != null) return error.UnrepresentableValue;
+        if (d.quoting == .git and !parser_mod.validGitSectionName(name)) return error.MalformedSectionHeader;
+    }
+
+    /// Reject a subsection name that would not survive a re-parse: empty or a
+    /// line break. Otherwise unrestricted -- `escapeSubsectionName` encodes
+    /// any backslash or double quote so the header stays well-formed.
+    fn validateSubsectionName(name: []const u8) DocumentError!void {
+        if (name.len == 0) return error.MalformedSectionHeader;
+        if (hasNewline(name)) return error.UnrepresentableValue;
     }
 
     /// Record a splice. A pure insertion (`start == end`) always composes,
@@ -421,6 +782,46 @@ fn hasNewline(s: []const u8) bool {
     return std.mem.indexOfAny(u8, s, "\n\r") != null;
 }
 
+/// True when `s` has a leading or trailing space/tab, which a trimming
+/// dialect would strip on re-parse.
+fn edgeWhitespace(s: []const u8) bool {
+    if (s.len == 0) return false;
+    return s[0] == ' ' or s[0] == '\t' or s[s.len - 1] == ' ' or s[s.len - 1] == '\t';
+}
+
+/// Escape `\` and `"` for a quoted subsection header (`[section "name"]`),
+/// the git-recognized pair `unescapeSubsection` decodes back. Any other byte
+/// (already screened for a line break by the caller) passes through verbatim.
+fn escapeSubsectionName(arena: Allocator, name: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOfAny(u8, name, "\\\"") == null) return name;
+    var out: std.ArrayList(u8) = .empty;
+    for (name) |c| {
+        if (c == '\\' or c == '"') try out.append(arena, '\\');
+        try out.append(arena, c);
+    }
+    return out.items;
+}
+
+/// Leading bytes to prepend before a brand-new section header so it starts
+/// its own paragraph: no separator for an empty document (nothing precedes
+/// it), one blank line when the document already ends in one, two newlines
+/// (terminate the dangling last line, then a blank line) otherwise.
+fn newSectionSeparator(source: []const u8) []const u8 {
+    if (source.len == 0) return "";
+    if (std.mem.endsWith(u8, source, "\n\n")) return "";
+    if (std.mem.endsWith(u8, source, "\n")) return "\n";
+    return "\n\n";
+}
+
+/// A single `\n` to prepend when `at` does not already sit right after a
+/// newline (or at the very start of the source), so text inserted there
+/// starts its own line instead of running onto a dangling, unterminated
+/// prior line.
+fn leadingNewlineIfNeeded(source: []const u8, at: usize) []const u8 {
+    if (at == 0 or source[at - 1] == '\n') return "";
+    return "\n";
+}
+
 /// Ordering for the splice list: by start, then insertions (zero-width) before
 /// range edits at the same start, then by call order.
 fn spliceLess(a: Splice, b: Splice) bool {
@@ -503,12 +904,15 @@ test "set produces a minimal diff and preserves comments" {
 }
 
 test "a failed edit leaves the document unchanged (atomic)" {
+    // A missing section/key no longer errors (it is created -- see the
+    // CREATE tests below); an over-deep path still does, since gitconfig's
+    // header shape has no fourth level to create.
     const G = @import("dialect.zig").Dialect.gitconfig;
     const src = "[user]\n\tname = Ada\n";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var doc = try Document.parse(arena.allocator(), src, .{ .dialect = G });
-    try std.testing.expectError(error.PathNotFound, doc.set("missing.key", "x"));
+    try std.testing.expectError(error.PathNotFound, doc.set("missing.section.sub.key", "x"));
     var aw: std.Io.Writer.Allocating = .init(arena.allocator());
     try doc.emit(&aw.writer);
     try std.testing.expectEqualStrings(src, aw.written());
@@ -1140,4 +1544,353 @@ test "R2: setLiteral rejects an unbalanced git quote (atomic)" {
     const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
     try testing.expectEqualStrings("a\"b", v2.get("s.k").?.string);
     try testing.expectEqualStrings("w", v2.get("s.next").?.string);
+}
+
+// CREATE: missing section, empty-document bootstrap, and segment paths.
+
+test "CREATE: set creates a missing section, byte-preserving existing comments and entries" {
+    const G = Dialect.gitconfig;
+    const src = "# top-level comment\n[user]\n\tname = Ada\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("server.port", @as(u16, 8080));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    // One blank line separates the new section; its key mirrors the "\t"
+    // indentation already used by the existing section's entry.
+    try testing.expectEqualStrings(
+        "# top-level comment\n[user]\n\tname = Ada\n\n[server]\n\tport = 8080\n",
+        out,
+    );
+    const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
+    // The comment, the existing section, and its entry all survive untouched.
+    try testing.expectEqualStrings("Ada", v2.get("user.name").?.string);
+    try testing.expectEqualStrings("8080", v2.get("server.port").?.string);
+}
+
+test "CREATE: set into an empty document bootstraps the whole section and key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.empty(a, .{ .dialect = Dialect.strict });
+    // An untouched empty() document emits exactly the empty string.
+    var aw0: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw0.writer);
+    try testing.expectEqualStrings("", aw0.written());
+
+    try doc.set("server.port", @as(u16, 8080));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.strict });
+    try testing.expectEqualStrings("[server]\nport = 8080\n", out);
+    try testing.expectEqualStrings("8080", doc.get("server.port").?.string);
+}
+
+test "CREATE: setSegments creates a section literally named with a dot, not a nested path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.empty(a, .{ .dialect = Dialect.strict });
+    try doc.setSegments(&.{ "weird.name", "key" }, @as([]const u8, "v"));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[weird.name]\nkey = v\n", aw.written());
+
+    // Re-parse independently and walk the tree: exactly one section named
+    // "weird.name" verbatim (Dialect.strict has no subsection syntax to fold
+    // it into), not a nested "weird" -> "name".
+    const v2 = try parser_mod.parse(a, aw.written(), .{ .dialect = Dialect.strict });
+    try testing.expectEqual(@as(usize, 1), v2.section.entries.len);
+    try testing.expectEqualStrings("weird.name", v2.section.entries[0].key);
+    try testing.expectEqualStrings("v", v2.section.entries[0].value.section.entries[0].value.string);
+    // The dotted string API cannot address this (a 3-deep path is over the
+    // 2-deep strict-dialect cap), confirming segments were required.
+    try testing.expect(doc.get("weird.name.key") == null);
+}
+
+test "CREATE: removeSegments removes an entry addressed by explicit segments" {
+    const G = Dialect.gitconfig;
+    const src = "[branch \"feature.x\"]\n\tmerge = refs/heads/main\n\tremote = origin\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{ "branch", "feature.x", "merge" });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[branch \"feature.x\"]\n\tremote = origin\n", out);
+}
+
+test "CREATE: an existing section+key set via segments is byte-identical to the string-path route" {
+    const src = "[s]\nk = old\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var doc1 = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc1.setLiteral("s.k", "new");
+    var aw1: std.Io.Writer.Allocating = .init(a);
+    try doc1.emit(&aw1.writer);
+
+    var doc2 = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc2.setLiteralSegments(&.{ "s", "k" }, "new");
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    try doc2.emit(&aw2.writer);
+
+    try testing.expectEqualStrings(aw1.written(), aw2.written());
+    try testing.expectEqualStrings("[s]\nk = new\n", aw1.written());
+}
+
+test "CREATE: an over-deep segment path errors without creating anything" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    // gitconfig's deepest shape is section + subsection + key (3 segments).
+    try testing.expectError(error.PathNotFound, doc.setSegments(&.{ "a", "b", "c", "d" }, @as([]const u8, "v")));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "CREATE: a single-segment path is a root key only when the dialect allows global_keys" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // strict: no global_keys -> a bare 1-segment path can never be created.
+    {
+        var doc = try Document.parse(a, "[s]\nk = v\n", .{ .dialect = Dialect.strict });
+        try testing.expectError(error.PathNotFound, doc.set("y", @as([]const u8, "2")));
+    }
+    // generic: global_keys -> appended after the last existing global key.
+    {
+        var doc = try Document.parse(a, "x = 1\n[s]\nk = v\n", .{ .dialect = Dialect.generic });
+        try doc.set("y", @as([]const u8, "2"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.generic });
+        try testing.expectEqualStrings("x = 1\ny = 2\n[s]\nk = v\n", out);
+    }
+    // generic, no existing global key: created at the very start of the file.
+    {
+        var doc = try Document.parse(a, "[s]\nk = v\n", .{ .dialect = Dialect.generic });
+        try doc.set("y", @as([]const u8, "2"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.generic });
+        try testing.expectEqualStrings("y = 2\n[s]\nk = v\n", out);
+    }
+}
+
+test "CREATE: create a missing gitconfig subsection appends a whole new header block" {
+    const G = Dialect.gitconfig;
+    const src = "[branch \"main\"]\n\tmerge = refs/heads/main\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("branch.feature.merge", @as([]const u8, "refs/heads/feature"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(
+        "[branch \"main\"]\n\tmerge = refs/heads/main\n\n[branch \"feature\"]\n\tmerge = refs/heads/feature\n",
+        out,
+    );
+    const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
+    try testing.expectEqualStrings("refs/heads/main", v2.get("branch.main.merge").?.string);
+    try testing.expectEqualStrings("refs/heads/feature", v2.get("branch.feature.merge").?.string);
+}
+
+test "CREATE: set appends a key into an existing but entirely empty section" {
+    const src = "[cache]\n[other]\nx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc.set("cache.ttl", @as(u32, 300));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.strict });
+    try testing.expectEqualStrings("[cache]\nttl = 300\n[other]\nx = 1\n", out);
+}
+
+test "CREATE: a container segment that already names a scalar is InvalidValue, not created" {
+    const src = "server = direct\n[other]\nx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
+    try testing.expectError(error.InvalidValue, doc.set("server.port", @as([]const u8, "9000")));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "CREATE: two sequential creates into the same still-missing section both survive" {
+    // Each create resolves against the ORIGINAL parse (matching every other
+    // edit in this Document), so a section created by one call is not yet
+    // visible to a second create in the same session; both append a full new
+    // header block at the end of the document. Under the default (and every
+    // built-in preset's) `duplicate_sections = .merge` policy the two blocks
+    // simply merge on read, so both keys are set correctly -- just not as
+    // tidily as a single merged block.
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("b.y", @as([]const u8, "1"));
+    try doc.set("b.z", @as([]const u8, "2"));
+    try testing.expectEqualStrings("1", doc.get("b.y").?.string);
+    try testing.expectEqualStrings("2", doc.get("b.z").?.string);
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "[b]"));
+    const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
+    try testing.expectEqualStrings("1", v2.get("b.y").?.string);
+    try testing.expectEqualStrings("2", v2.get("b.z").?.string);
+}
+
+test "CREATE: a brand-new section with no trailing newline in the source gets terminated first" {
+    const src = "[a]\n\tx = 1";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.gitconfig });
+    try doc.set("b.y", @as([]const u8, "2"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.gitconfig });
+    try testing.expectEqualStrings("[a]\n\tx = 1\n\n[b]\n\ty = 2\n", out);
+}
+
+test "CREATE: a brand-new section after an existing blank line gets no extra blank line" {
+    const src = "[a]\n\tx = 1\n\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.gitconfig });
+    try doc.set("b.y", @as([]const u8, "2"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.gitconfig });
+    try testing.expectEqualStrings("[a]\n\tx = 1\n\n[b]\n\ty = 2\n", out);
+}
+
+test "CREATE: a key or section name that would not round-trip is rejected before any splice" {
+    // A key containing the assign char would truncate itself on re-parse.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.UnrepresentableValue, doc.setSegments(&.{ "newsec", "a=b" }, @as([]const u8, "v")));
+    }
+    // A key starting with a comment char would misclassify the whole line.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.UnrepresentableValue, doc.setSegments(&.{ "newsec", "#bad" }, @as([]const u8, "v")));
+    }
+    // A key starting with '[' would misclassify as a section header.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.UnrepresentableValue, doc.setSegments(&.{ "newsec", "[bad" }, @as([]const u8, "v")));
+    }
+    // A section name with edge whitespace would be trimmed differently on re-parse.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.UnrepresentableValue, doc.setSegments(&.{ " newsec", "k" }, @as([]const u8, "v")));
+    }
+    // A plain section name containing '"' under a subsection-quoting dialect
+    // would be misread as opening a quoted subsection.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.UnrepresentableValue, doc.setSegments(&.{ "weird\"name", "k" }, @as([]const u8, "v")));
+    }
+    // A subsection name with an embedded newline would break the header line.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.UnrepresentableValue, doc.setSegments(&.{ "branch", "bad\nsub", "k" }, @as([]const u8, "v")));
+    }
+    // An empty section name or key.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.strict });
+        try testing.expectError(error.MalformedSectionHeader, doc.setSegments(&.{ "", "k" }, @as([]const u8, "v")));
+        try testing.expectError(error.EmptyKey, doc.setSegments(&.{ "sec", "" }, @as([]const u8, "v")));
+    }
+    // git charset: a key must start with a letter; a section name may not
+    // contain a space.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var doc = try Document.parse(arena.allocator(), "[x]\ny = 1\n", .{ .dialect = Dialect.gitconfig });
+        try testing.expectError(error.InvalidKey, doc.setSegments(&.{ "sec", "1bad" }, @as([]const u8, "v")));
+        try testing.expectError(error.MalformedSectionHeader, doc.setSegments(&.{ "bad name", "k" }, @as([]const u8, "v")));
+    }
+}
+
+test "CREATE: appending into a top-level section that mixes scalars and subsections anchors on the last scalar" {
+    // "branch" has a direct scalar entry ("x") AND a subsection entry
+    // ("main"), in that order -- the subsection entry has no span, so the
+    // append must skip past it rather than trying to anchor on it.
+    const G = Dialect.gitconfig;
+    const src = "[branch]\n\tx = 1\n[branch \"main\"]\n\tmerge = refs/heads/main\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("branch.y", @as([]const u8, "2"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    // Appended right after the bare block's own last entry, not after the
+    // (later, unrelated) subsection block.
+    try testing.expectEqualStrings(
+        "[branch]\n\tx = 1\n\ty = 2\n[branch \"main\"]\n\tmerge = refs/heads/main\n",
+        out,
+    );
+}
+
+test "CREATE: a top-level section that exists only as subsection blocks gets a fresh bare header" {
+    // No bare [branch] header exists anywhere -- only [branch "main"], so
+    // there is neither a scalar entry nor a bare header line to anchor a
+    // direct branch.* key on.
+    const G = Dialect.gitconfig;
+    const src = "[branch \"main\"]\n\tmerge = refs/heads/main\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("branch.y", @as([]const u8, "2"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(
+        "[branch \"main\"]\n\tmerge = refs/heads/main\n\n[branch]\n\ty = 2\n",
+        out,
+    );
+}
+
+test "CREATE: a new key colliding with an existing section/subsection name is InvalidValue, not a silent shadow" {
+    // Root level: "s" already names a whole [s] section.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, "[s]\nk = v\n", .{ .dialect = Dialect.generic });
+        try testing.expectError(error.InvalidValue, doc.set("s", @as([]const u8, "direct")));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("[s]\nk = v\n", aw.written());
+    }
+    // Nested level: "main" already names a subsection of "branch".
+    {
+        const G = Dialect.gitconfig;
+        const src = "[branch \"main\"]\n\tmerge = refs/heads/main\n";
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try testing.expectError(error.InvalidValue, doc.set("branch.main", @as([]const u8, "direct")));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings(src, aw.written());
+    }
 }

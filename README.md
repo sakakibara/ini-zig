@@ -153,7 +153,20 @@ try doc.emit(&aw.writer);
 ```
 
 `set` on an existing path replaces only the value's bytes; keys, comments, and surrounding
-formatting stay put.
+formatting stay put. `set` on a path whose section is missing creates it -- a new
+`[section]` (or `[section "subsection"]` under a subsection-quoting dialect) is appended
+at the end of the document, one blank line after prior content, with the key inside it; a
+missing key in an existing section is just appended to it.
+
+```zig
+// Bootstrap a config layer that may not exist on disk yet.
+var doc = try ini.Document.empty(arena, .{});
+try doc.set("server.port", @as(u16, 9443)); // creates "[server]\nport = 9443\n"
+
+// Segment paths address a name containing a literal '.' unambiguously (e.g. a
+// gitconfig subsection), and create the same way as the dotted-string API:
+try doc.setSegments(&.{ "branch", "feature.x", "merge" }, "refs/heads/feature.x");
+```
 
 ### Source spans
 
@@ -306,6 +319,7 @@ matching `GetPrivateProfileString` behavior. An unbalanced or single quote is ke
 | `encodeTyped(w, value, arena, options)` | Encode a typed value via comptime reflection. |
 | `getT(T, arena, value, path, options)` | Decode a dotted-path entry to `T`; null on miss or mismatch, error on OOM. |
 | `Document.parse(arena, src, options)` | Lossless parse for the document model. |
+| `Document.empty(arena, options)` | Bootstrap a document with no source bytes (a file that may not exist yet). |
 | `EventReader.fromReader(gpa, reader, options)` | Line-oriented event reader backed by a `std.Io.Reader`. |
 | `EventReader.next()` | Pull the next `Event` (`null` at end of input). |
 | `EventReader.materialize(arena)` | Compose the entire remaining stream into a `Value` via the buffered parser. |
@@ -367,7 +381,8 @@ returns `DocumentError`. Errors a caller may want to match:
 | `CommentsNotSupported` | `setTrailingComment` called under a dialect without inline comments. |
 | `ConflictingEdit` | Two document edits covered overlapping byte ranges. |
 | `InvalidComment` | Comment text contained a newline character. |
-| `UnrepresentableValue` | Value cannot be encoded or spliced without breaking document structure. |
+| `UnrepresentableValue` | Value, key, or section name cannot be encoded or spliced without breaking document structure. |
+| `InvalidValue` | A create-on-set path collides with the wrong kind of existing value: a container segment already names a string/list value, or the leaf key already names a section. |
 
 Generated reference docs are published at **https://sakakibara.github.io/ini-zig/**.
 

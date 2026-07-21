@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `Document.empty`: bootstrap a document with no source bytes at all, for a
+  config layer that may not exist on disk yet. The first edit creates the
+  whole requested section and key.
+- `Document.setSegments` / `setLiteralSegments` / `removeSegments`: address a
+  path as pre-split segments instead of a dotted string, so a section or key
+  name containing a literal `.` (e.g. a gitconfig subsection) is addressed
+  unambiguously. `set` / `setLiteral` / `remove` now split a dotted string
+  into segments the same way internally, so a dot-free path behaves
+  identically either way.
+
+### Changed
+
+- `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments` now
+  CREATE a missing section (or, under a subsection-quoting dialect, a
+  missing subsection) instead of returning `error.PathNotFound`: a whole new
+  `[section]` or `[section "subsection"]` header plus the key is appended at
+  the end of the document, one blank line after prior content. A missing key
+  in an existing section is appended to it. This is the one intentional
+  behavior change; every other case (an existing path, a genuinely over-deep
+  path, a container segment that already names a non-section value) is
+  unchanged.
+
 ## [0.2.0] - 2026-07-05
 
 ### Added

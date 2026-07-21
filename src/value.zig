@@ -233,10 +233,10 @@ pub const Section = struct {
 };
 
 /// Splits a dotted path on `.` one segment at a time.
-const PathIterator = struct {
+pub const PathIterator = struct {
     rest: []const u8,
 
-    fn next(self: *PathIterator) ?[]const u8 {
+    pub fn next(self: *PathIterator) ?[]const u8 {
         if (self.rest.len == 0) return null;
         const dot = std.mem.indexOfScalar(u8, self.rest, '.') orelse {
             const seg = self.rest;
