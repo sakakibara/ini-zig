@@ -25,6 +25,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `Document`: a key appended into the section that ends the file no longer
+  slips into a section created later in the same edit session. Both an
+  append into an existing last section and a brand-new appended section
+  anchor at end-of-file, so when several edits are batched before `emit`,
+  a key issued after a new-section create was emitted after that new block
+  and silently landed in the wrong section (dropping it from its own). A
+  newly appended section block now always emits after any same-position
+  insertion into existing content. Affects both scalar (`set`/`setSegments`)
+  and multi-value (`setValueSegments` `.list`) appends.
 - `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments`:
   resolving a path into an existing section under a case-folding dialect
   (`generic`, `gitconfig`, `windows`) now matches a differently-cased

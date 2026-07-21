@@ -82,6 +82,15 @@ const Splice = struct {
     end: usize,
     text: []const u8,
     seq: u32,
+    /// A brand-new section block appended at end-of-file (`appendNewSection`/
+    /// `appendNewSectionList`). It anchors at `source.len`, which equals the
+    /// `line_end` of the last existing section's final key when that section
+    /// ends the file -- so a key inserted into that last section and a new
+    /// appended section collide at the same zero-width offset. A tail append
+    /// always emits AFTER any same-offset insertion into existing content
+    /// (see `spliceLess`), so such a key stays in its own section instead of
+    /// slipping inside the appended one, regardless of edit order.
+    tail: bool,
 };
 
 /// One `recordSplice` call's arguments, queued up so several can be recorded
@@ -999,7 +1008,7 @@ pub const Document = struct {
         const text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}{s} {c} {s}{s}", .{
             sep, header, indent, key, self.assignChar(), raw, nl,
         });
-        try self.recordSplice(self.source.len, self.source.len, text);
+        try self.recordSpliceKind(self.source.len, self.source.len, text, true);
         const value_start = sep.len + header.len + indent.len + key.len + 3;
         return .{ .start = value_start, .end = value_start + raw.len };
     }
@@ -1154,7 +1163,7 @@ pub const Document = struct {
         const indent = self.prevailingIndent();
         const leading = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ sep, header });
         const block = try self.buildEntryBlock(leading, indent, key, values);
-        try self.recordSplice(self.source.len, self.source.len, block.text);
+        try self.recordSpliceKind(self.source.len, self.source.len, block.text, true);
         return .{ .leading = leading, .indent = indent, .key = key, .offsets = block.offsets };
     }
 
@@ -1251,6 +1260,13 @@ pub const Document = struct {
     /// rolled back (its splice removed / its overwritten text restored) so a
     /// failed edit leaves the document EXACTLY as before and get()==emit()==pre-edit.
     fn recordSplice(self: *Document, start: usize, end: usize, text: []const u8) DocumentError!void {
+        return self.recordSpliceKind(start, end, text, false);
+    }
+
+    /// `recordSplice` with an explicit `tail` (see `Splice.tail`): a brand-new
+    /// end-of-file section block passes `true` so it sorts after any same-offset
+    /// insertion into existing content.
+    fn recordSpliceKind(self: *Document, start: usize, end: usize, text: []const u8, tail: bool) DocumentError!void {
         const new_range = end > start;
         for (self.splices.items, 0..) |s, i| {
             const ex_range = s.end > s.start;
@@ -1284,7 +1300,7 @@ pub const Document = struct {
             }
         }
         const owned = try self.arena.dupe(u8, text);
-        const sp = Splice{ .start = start, .end = end, .text = owned, .seq = self.seq };
+        const sp = Splice{ .start = start, .end = end, .text = owned, .seq = self.seq, .tail = tail };
         var idx: usize = 0;
         while (idx < self.splices.items.len and spliceLess(self.splices.items[idx], sp)) idx += 1;
         try self.splices.insert(self.arena, idx, sp);
@@ -1506,6 +1522,11 @@ fn spliceLess(a: Splice, b: Splice) bool {
     const a_ins = a.start == a.end;
     const b_ins = b.start == b.end;
     if (a_ins != b_ins) return a_ins;
+    // Among zero-width insertions at the same offset, an end-of-file new
+    // section block always emits after an insertion into existing content, so
+    // a key appended into a section that ends the file is not displaced into
+    // a later-appended section (see `Splice.tail`).
+    if (a_ins and a.tail != b.tail) return b.tail;
     return a.seq < b.seq;
 }
 
@@ -2420,6 +2441,55 @@ test "CREATE: two sequential creates into the same still-missing section both su
     const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
     try testing.expectEqualStrings("1", v2.get("b.y").?.string);
     try testing.expectEqualStrings("2", v2.get("b.z").?.string);
+}
+
+test "CREATE: a key appended into the file's last section stays there when a new section was created first" {
+    // Both edits anchor at the same zero-width offset: the source's last
+    // section ends exactly at EOF, so appending a key into it lands at
+    // `source.len` -- the very offset a brand-new section block is appended
+    // at. Ordered by recording sequence alone, the key issued AFTER the
+    // new-section create would emit after that new block, silently slipping
+    // into the wrong section. The new-section block must always emit last.
+    const G = Dialect.generic;
+    const src = "[s1]\nk1 = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "s2", "k2" }, @as([]const u8, "x")); // create a new section
+    try doc.setSegments(&.{ "s1", "new" }, @as([]const u8, "N")); // append into the last existing one
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    const v = try parser_mod.parse(a, out, .{ .dialect = G });
+    try testing.expectEqualStrings("N", v.getSegments(&.{ "s1", "new" }).?.string);
+    try testing.expectEqualStrings("v", v.getSegments(&.{ "s1", "k1" }).?.string);
+    try testing.expectEqualStrings("x", v.getSegments(&.{ "s2", "k2" }).?.string);
+    // `new` sits inside [s1], before the appended [s2] header.
+    const new_at = std.mem.indexOf(u8, out, "new = N").?;
+    const s2_at = std.mem.indexOf(u8, out, "[s2]").?;
+    try testing.expect(new_at < s2_at);
+}
+
+test "CREATE: a list key appended into the file's last section stays there after a new section create" {
+    // The multi-value (`setValueSegments` .list) counterpart of the scalar
+    // last-section-at-EOF displacement: the same EOF-offset collision applies
+    // to a whole appended `key = item` block.
+    const G = Dialect.gitconfig;
+    const src = "[s1]\nk1 = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setValueSegments(&.{ "s2", "k2" }, .{ .list = &.{ "a", "b" } }); // new section
+    try doc.setValueSegments(&.{ "s1", "new" }, .{ .list = &.{ "p", "q" } }); // into last existing
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    const v = try parser_mod.parse(a, out, .{ .dialect = G });
+    const got = v.getSegments(&.{ "s1", "new" }).?;
+    try testing.expectEqual(@as(usize, 2), got.list.len);
+    try testing.expectEqualStrings("p", got.list[0]);
+    try testing.expectEqualStrings("q", got.list[1]);
+    const new_at = std.mem.indexOf(u8, out, "new = p").?;
+    const s2_at = std.mem.indexOf(u8, out, "[s2]").?;
+    try testing.expect(new_at < s2_at);
 }
 
 test "CREATE: repeating an identical create-set on a freshly created path is a byte-identical no-op" {
