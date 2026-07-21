@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments`:
+  resolving a path into an existing section under a case-folding dialect
+  (`generic`, `gitconfig`, `windows`) now matches a differently-cased
+  section name (e.g. `X`) into the already-parsed section (`[x]`) instead of
+  appending a case-variant duplicate header that would only merge with it on
+  the next re-parse. Subsection names are unaffected -- they are always
+  matched case-sensitively, regardless of dialect.
+
 ## [0.3.0] - 2026-07-21
 
 ### Added

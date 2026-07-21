@@ -336,9 +336,25 @@ pub const Document = struct {
     /// `Section.locateSegments`).
     fn locateSegments(self: *const Document, segments: []const []const u8) DocumentError!?Anchors {
         if (segments.len == 0) return null;
-        const joined = try std.mem.join(self.arena, ".", segments);
+        const joined = try self.joinSectionFolded(segments);
         const span = self.spans.get(joined) orelse return null;
         return self.anchorsForSpan(span);
+    }
+
+    /// Join `segments` into the dot-joined key `recordSpan` stores, folding
+    /// the section-name segment (index 0) the same way the parser folds it
+    /// under `case_insensitive_sections` -- see `foldedSection`. A 1-segment
+    /// path is a root-level global key, not a section, and is joined
+    /// verbatim; a subsection or leaf-key segment is never folded here.
+    fn joinSectionFolded(self: *const Document, segments: []const []const u8) Allocator.Error![]const u8 {
+        if (segments.len < 2) return std.mem.join(self.arena, ".", segments);
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(self.arena, try self.foldedSection(segments[0]));
+        for (segments[1..]) |seg| {
+            try out.append(self.arena, '.');
+            try out.appendSlice(self.arena, seg);
+        }
+        return out.items;
     }
 
     /// Split a dotted string path into arena-owned segments, exactly as
@@ -403,10 +419,19 @@ pub const Document = struct {
     /// entirely or partially missing (create it); `error.InvalidValue` when a
     /// segment along the way already names a string/list value instead of a
     /// section (can neither be descended into nor created under).
-    fn resolveContainer(self: *const Document, container: []const []const u8) error{InvalidValue}!?*Section {
+    ///
+    /// Segment 0 (the top-level section name) is folded the same way the
+    /// parser folds it under `case_insensitive_sections` before comparing,
+    /// so `set("X.k", v)` resolves INTO an existing `[x]` instead of
+    /// mismatching and creating a case-variant `[X]` header that would merge
+    /// with `[x]` on re-parse. A subsection segment (index 1) is never
+    /// folded -- it is always stored case-sensitively (see `openHeader` in
+    /// parser.zig).
+    fn resolveContainer(self: *const Document, container: []const []const u8) (error{InvalidValue} || Allocator.Error)!?*Section {
         var cur: *Section = self.parsed.section;
-        for (container) |seg| {
-            const val = cur.findValue(seg) orelse return null;
+        for (container, 0..) |seg, i| {
+            const lookup = if (i == 0) try self.foldedSection(seg) else seg;
+            const val = cur.findValue(lookup) orelse return null;
             if (val != .section) return error.InvalidValue;
             cur = val.section;
         }
@@ -423,6 +448,17 @@ pub const Document = struct {
             try parser_mod.toLowerAlloc(self.arena, key)
         else
             key;
+    }
+
+    /// Fold a top-level section-name segment the same way the parser folds
+    /// it when storing (`openHeader` in parser.zig): lower-cased under
+    /// `case_insensitive_sections`, unchanged otherwise. A quoted subsection
+    /// is always stored case-sensitively and must never be passed here.
+    fn foldedSection(self: *const Document, name: []const u8) Allocator.Error![]const u8 {
+        return if (self.options.dialect.case_insensitive_sections)
+            try parser_mod.toLowerAlloc(self.arena, name)
+        else
+            name;
     }
 
     /// Create and append the key (and its section/subsection, if missing)
@@ -510,8 +546,15 @@ pub const Document = struct {
         var at: usize = undefined;
         var indent: []const u8 = undefined;
         if (lastScalarKey(section)) |last_key| {
-            const joined = try std.mem.join(self.arena, ".", container);
-            const full = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ joined, last_key });
+            // Rebuild the sibling's full span-map key the same way `full`
+            // must match what `recordSpan` stored: `container` here is the
+            // caller's raw path (may differ in case from a folded section
+            // name resolveContainer already matched into), so route through
+            // `joinSectionFolded` rather than joining it verbatim.
+            var full_segments: [3][]const u8 = undefined;
+            for (container, 0..) |seg, i| full_segments[i] = seg;
+            full_segments[container.len] = last_key;
+            const full = try self.joinSectionFolded(full_segments[0 .. container.len + 1]);
             const a = self.anchorsForSpan(self.spans.get(full).?);
             at = a.line_end;
             indent = a.indent;
@@ -2002,6 +2045,58 @@ test "CREATE: a case-folded collision with an existing subsection is caught (nes
         try testing.expectEqualStrings("x", v2.getSegments(&.{ "branch", "other" }).?.string);
         try testing.expectEqualStrings("refs/heads/main", v2.get("branch.main.merge").?.string);
     }
+}
+
+test "CREATE: setSegments on a differently-cased section resolves into the existing one under a folding dialect" {
+    // generic folds section names, so "X" must resolve into the already-
+    // parsed "[x]" instead of the container going unresolved and a
+    // case-variant "[X]" header being appended (which would merge with
+    // "[x]" on re-parse, but only after fragmenting the source first).
+    const src = "[x]\na = 1\nb = 2\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Value-replace on an existing key: caught by locateSegments's own
+    // folded lookup, so this never even reaches the create path.
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
+        try doc.setSegments(&.{ "X", "a" }, @as([]const u8, "9"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.generic });
+        try testing.expectEqualStrings("[x]\na = 9\nb = 2\n", out);
+        const v2 = try parser_mod.parse(a, out, .{ .dialect = Dialect.generic });
+        try testing.expectEqual(@as(usize, 1), v2.section.entries.len);
+    }
+    // A new key under the differently-cased section: caught by
+    // resolveContainer's folded lookup, appending into the existing section
+    // instead of creating a second header.
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
+        try doc.setSegments(&.{ "X", "c" }, @as([]const u8, "3"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.generic });
+        try testing.expectEqualStrings("[x]\na = 1\nb = 2\nc = 3\n", out);
+        const v2 = try parser_mod.parse(a, out, .{ .dialect = Dialect.generic });
+        try testing.expectEqual(@as(usize, 1), v2.section.entries.len);
+        try testing.expectEqualStrings("3", v2.get("x.c").?.string);
+    }
+}
+
+test "CREATE: setSegments on a differently-cased section creates a distinct one under a case-sensitive dialect" {
+    // strict never folds section names, so "X" and the existing "x" are
+    // genuinely distinct sections, matching set()'s ordinary create-missing
+    // behavior.
+    const src = "[x]\nk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc.setSegments(&.{ "X", "k" }, @as([]const u8, "v2"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.strict });
+    try testing.expectEqualStrings("[x]\nk = v\n\n[X]\nk = v2\n", out);
+    const v2 = try parser_mod.parse(a, out, .{ .dialect = Dialect.strict });
+    try testing.expectEqual(@as(usize, 2), v2.section.entries.len);
+    try testing.expectEqualStrings("v", v2.get("x.k").?.string);
+    try testing.expectEqualStrings("v2", v2.get("X.k").?.string);
 }
 
 test "CREATE: a brand-new section on a CRLF source uses CRLF throughout, with no doubled blank line" {
