@@ -56,6 +56,18 @@ pub fn build(b: *std.Build) void {
     const run_xcheck = b.addRunArtifact(xcheck_tests);
     test_step.dependOn(&run_xcheck.step);
 
+    // Deterministic property/round-trip battery over the Document editor.
+    const document_property_module = b.createModule(.{
+        .root_source_file = b.path("src/document_property.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ini.zig", .module = ini_module }},
+    });
+
+    const document_property_tests = b.addTest(.{ .root_module = document_property_module });
+    const run_document_property = b.addRunArtifact(document_property_tests);
+    test_step.dependOn(&run_document_property.step);
+
     // Bounded fuzz regression test: 1000 iterations with a fixed seed, always
     // included in `zig build test` so the round-trip invariant is never skipped.
     const fuzz_tests = b.addTest(.{

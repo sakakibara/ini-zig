@@ -15,6 +15,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   appending a case-variant duplicate header that would only merge with it on
   the next re-parse. Subsection names are unaffected -- they are always
   matched case-sensitively, regardless of dialect.
+- Repeating an identical `set`/`setLiteral`/`setSegments`/`setLiteralSegments`
+  call is now a byte-identical no-op in two cases that previously duplicated
+  the edit instead: setting a path an earlier edit in the same session
+  already created (a created path never gains a span, so it was invisible to
+  every later lookup); and re-setting an existing key whose value was empty
+  (a zero-width splice). The latter risked silently turning a scalar value
+  into a multi-value list under an accumulating dialect (e.g. gitconfig) on
+  a plain repeat.
 
 ## [0.3.0] - 2026-07-21
 

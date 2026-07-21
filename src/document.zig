@@ -116,6 +116,15 @@ pub const Document = struct {
     splices: std.ArrayList(Splice),
     /// Monotonic counter assigning each splice its call-order tiebreaker.
     seq: u32,
+    /// Path (folded the same way `joinSectionFolded` keys `spans`) -> raw
+    /// bytes last used to CREATE it, for every path created by an edit in
+    /// this session. `parsed`/`spans` stay pinned to the original source, so
+    /// a path an edit created is invisible to `locateSegments` forever after
+    /// (it never gains a span); without this cache, repeating the exact same
+    /// create-`set` would not recognize its own prior create and would
+    /// append a second, duplicate entry instead of being the no-op every
+    /// other repeated `set` already is. Cleared for a path on `removeSegments`.
+    created: std.StringHashMapUnmanaged([]const u8),
 
     pub fn parse(arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) DocumentError!Document {
         const has_bom = std.mem.startsWith(u8, src, "\xEF\xBB\xBF");
@@ -137,6 +146,7 @@ pub const Document = struct {
             .spans = spans,
             .splices = .empty,
             .seq = 0,
+            .created = .empty,
         };
     }
 
@@ -164,6 +174,7 @@ pub const Document = struct {
             .spans = .empty,
             .splices = .empty,
             .seq = 0,
+            .created = .empty,
         };
     }
 
@@ -265,7 +276,24 @@ pub const Document = struct {
             }
             return self.recordSplice(a.value_start, a.value_end, raw);
         }
-        return self.insertSegments(segments, raw);
+        // A path an earlier create in this session already added is
+        // permanently invisible to `locateSegments` (see `created`'s doc
+        // comment), so an exact repeat of that same create is recognized
+        // here instead: a byte-identical no-op, matching how a repeat set on
+        // an originally-existing path is already a no-op via the exact-range
+        // overwrite in recordSplice.
+        const created_key = try self.joinSectionFolded(segments);
+        if (self.created.get(created_key)) |prev_raw| {
+            if (std.mem.eql(u8, prev_raw, raw)) return;
+        }
+        // Prepare every fallible step before the mutating insert, so a
+        // failure here can never leave a splice recorded with no matching
+        // `created` entry (which would break the atomicity `recordSplice`
+        // otherwise guarantees).
+        const owned_raw = try self.arena.dupe(u8, raw);
+        try self.created.ensureUnusedCapacity(self.arena, 1);
+        try self.insertSegments(segments, raw);
+        self.created.putAssumeCapacity(created_key, owned_raw);
     }
 
     /// Delete the whole line containing `path`. Never creates.
@@ -277,6 +305,7 @@ pub const Document = struct {
     pub fn removeSegments(self: *Document, segments: []const []const u8) DocumentError!void {
         const a = try self.locateSegments(segments) orelse return error.PathNotFound;
         try self.recordSplice(a.line_start, a.line_end, "");
+        _ = self.created.remove(try self.joinSectionFolded(segments));
     }
 
     /// Insert a comment line immediately before the line containing `path`.
@@ -715,6 +744,16 @@ pub const Document = struct {
                 if (start < s.start and s.start < end) return error.ConflictingEdit;
             } else if (!new_range and ex_range) {
                 if (s.start < start and start < s.end) return error.ConflictingEdit;
+            } else if (s.start == start and std.mem.eql(u8, s.text, text)) {
+                // Both are zero-width insertions at the same point with
+                // byte-identical text: an exact repeat of a prior insertion
+                // (e.g. splicing the same value onto a key whose value was
+                // already empty, so both start and end sit at that same
+                // point). Two DIFFERENT insertions at the same point still
+                // legitimately compose (handled below); only a byte-for-byte
+                // repeat is a no-op, matching the idempotence every other
+                // edit already has via the exact-range overwrite above.
+                return;
             }
         }
         const owned = try self.arena.dupe(u8, text);
@@ -1824,6 +1863,65 @@ test "CREATE: two sequential creates into the same still-missing section both su
     const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
     try testing.expectEqualStrings("1", v2.get("b.y").?.string);
     try testing.expectEqualStrings("2", v2.get("b.z").?.string);
+}
+
+test "CREATE: repeating an identical create-set on a freshly created path is a byte-identical no-op" {
+    // A path a prior edit created is invisible to locateSegments forever
+    // after (its span map stays pinned to the ORIGINAL parse -- see the
+    // `created` field), so without the `created` cache below, repeating the
+    // exact same set would not recognize its own prior create and would
+    // append a second, duplicate entry instead of the no-op every other
+    // repeated set already is.
+    const G = Dialect.gitconfig;
+    const src = "[s]\nk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("s.newkey", @as([]const u8, "x"));
+    var aw1: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw1.writer);
+    const out1 = try a.dupe(u8, aw1.written());
+
+    try doc.set("s.newkey", @as([]const u8, "x"));
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw2.writer);
+    try testing.expectEqualStrings(out1, aw2.written());
+
+    // gitconfig accumulates duplicate keys, so a real (non-idempotent) repeat
+    // would have silently turned "x" from a scalar into a 2-element list.
+    const v2 = try parser_mod.parse(a, aw2.written(), .{ .dialect = G });
+    try testing.expectEqualStrings("x", v2.get("s.newkey").?.string);
+
+    // A DIFFERENT value on the same freshly created path is still a genuine
+    // second edit, not swallowed by the cache.
+    try doc.set("s.newkey", @as([]const u8, "y"));
+    var aw3: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw3.writer);
+    try testing.expect(!std.mem.eql(u8, out1, aw3.written()));
+}
+
+test "DOC1: repeating an identical set on an empty existing value is a byte-identical no-op" {
+    // "k = " has an empty value at a zero-width span (value_start ==
+    // value_end): recordSplice's insertion-vs-insertion dedup must still
+    // fire for two zero-width splices at the same point with identical
+    // text, not just for a non-empty (non-zero-width) range.
+    const src = "[s]\nk = \n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc.setLiteral("s.k", "v");
+    var aw1: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw1.writer);
+    const out1 = try a.dupe(u8, aw1.written());
+    try testing.expectEqualStrings("[s]\nk = v\n", out1);
+
+    try doc.setLiteral("s.k", "v");
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw2.writer);
+    try testing.expectEqualStrings(out1, aw2.written());
+    try testing.expectEqualStrings("v", doc.get("s.k").?.string);
 }
 
 test "CREATE: a brand-new section with no trailing newline in the source gets terminated first" {
