@@ -82,9 +82,10 @@ const Splice = struct {
     end: usize,
     text: []const u8,
     seq: u32,
-    /// A brand-new section block appended at end-of-file (`appendNewSection`/
-    /// `appendNewSectionList`). It anchors at `source.len`, which equals the
-    /// `line_end` of the last existing section's final key when that section
+    /// A brand-new section block appended at end-of-file (`appendNewSectionList`,
+    /// including via `insertSegments`'s single-value wrapper). It anchors at
+    /// `source.len`, which equals the `line_end` of the last existing
+    /// section's final key when that section
     /// ends the file -- so a key inserted into that last section and a new
     /// appended section collide at the same zero-width offset. A tail append
     /// always emits AFTER any same-offset insertion into existing content
@@ -126,10 +127,22 @@ const Anchors = struct {
 const ValueOffset = struct { start: usize, end: usize };
 
 /// Bookkeeping for one path created by an edit in this session -- see
-/// `Document.created`.
+/// `Document.created`. Carries the same `leading`/`indent`/`key` strings
+/// `CreatedListEntry` does (rather than just the value's own offset) so a
+/// same-session re-set of the OTHER kind (`overwriteCreatedScalarAsList`)
+/// can rebuild this splice as an N-line block from scratch, the same way
+/// `overwriteCreatedListValue` already rebuilds a list create.
 const CreatedEntry = struct {
     /// `Splice.seq` of the zero-width insertion that wrote this line.
     seq: u32,
+    /// Prefix (blank-line separator and/or a new section header) before the
+    /// line; "" when the line was appended into existing content with no
+    /// separator needed.
+    leading: []const u8,
+    /// Indentation the line uses.
+    indent: []const u8,
+    /// Key spelling the line uses.
+    key: []const u8,
     /// The value token's current byte range within that splice's `text`.
     value: ValueOffset,
     /// Raw bytes last used to create/update this path.
@@ -190,13 +203,18 @@ pub const Document = struct {
     /// the original splice by `CreatedEntry.seq` and overwrites its value
     /// substring in place (see `overwriteCreatedValue`), so re-setting a
     /// freshly created path to a new value never appends a second line.
-    /// Cleared for a path on `removeSegments`.
+    /// Cleared for a path on `removeSegments`. A path present here is never
+    /// also present in `created_lists`: a same-session re-set of the OTHER
+    /// kind migrates the entry across (see `overwriteCreatedScalarAsList`),
+    /// rather than letting a path be tracked under both.
     created: std.StringHashMapUnmanaged(CreatedEntry),
     /// `created`'s counterpart for a path created via `setValueSegments`'
     /// `.list` branch (`setListSegments`/`createListSegments`), keyed and
     /// cleared the same way. Kept separate from `created` (rather than a
     /// tagged union of the two) so the scalar path -- the overwhelmingly
-    /// common case -- stays untouched by the list machinery entirely.
+    /// common case -- stays untouched by the list machinery entirely. Same
+    /// single-kind-per-path invariant as `created`, migrated the other way
+    /// by `overwriteCreatedListAsScalar`.
     created_lists: std.StringHashMapUnmanaged(CreatedListEntry),
 
     pub fn parse(arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) DocumentError!Document {
@@ -393,11 +411,18 @@ pub const Document = struct {
         // path is already a no-op via the exact-range overwrite in
         // recordSplice), and a repeat with a DIFFERENT value overwrites the
         // prior create's value substring in place rather than falling
-        // through to `insertSegments`, which would append a second line.
+        // through to `insertSegments`, which would append a second line. A
+        // path created earlier this session as the OTHER kind (a list, via
+        // `setValueSegments`) is checked too: rather than appending a second,
+        // duplicate backing for the same path, the prior list create's lines
+        // are collapsed into this one scalar line in place.
         const created_key = try self.joinSectionFolded(segments);
         if (self.created.get(created_key)) |entry| {
             if (std.mem.eql(u8, entry.raw, raw)) return;
             return self.overwriteCreatedValue(created_key, entry, raw);
+        }
+        if (self.created_lists.get(created_key)) |entry| {
+            return self.overwriteCreatedListAsScalar(created_key, entry, raw);
         }
         // Prepare every fallible step before the mutating insert, so a
         // failure here can never leave a splice recorded with no matching
@@ -406,8 +431,15 @@ pub const Document = struct {
         const owned_raw = try self.arena.dupe(u8, raw);
         try self.created.ensureUnusedCapacity(self.arena, 1);
         const seq_before = self.seq;
-        const value = try self.insertSegments(segments, raw);
-        self.created.putAssumeCapacity(created_key, .{ .seq = seq_before, .value = value, .raw = owned_raw });
+        const res = try self.insertSegments(segments, raw);
+        self.created.putAssumeCapacity(created_key, .{
+            .seq = seq_before,
+            .leading = res.leading,
+            .indent = res.indent,
+            .key = res.key,
+            .value = res.offsets[0],
+            .raw = owned_raw,
+        });
     }
 
     /// Overwrite the value substring of a path created earlier this session
@@ -437,7 +469,46 @@ pub const Document = struct {
         };
         self.created.putAssumeCapacity(created_key, .{
             .seq = entry.seq,
+            .leading = entry.leading,
+            .indent = entry.indent,
+            .key = entry.key,
             .value = .{ .start = entry.value.start, .end = entry.value.start + raw.len },
+            .raw = owned_raw,
+        });
+    }
+
+    /// Cross-kind counterpart of `overwriteCreatedValue`: `path` was created
+    /// earlier this session as a LIST (`created_lists`) and is now being
+    /// re-set as a scalar. Rebuilds the same splice (found by `entry.seq`,
+    /// reusing its `leading`/`indent`/`key`) as a single `key = raw` line via
+    /// `buildEntryBlock`, rather than leaving the old N list lines in place
+    /// and appending a new scalar line alongside them. Bookkeeping moves from
+    /// `created_lists` to `created` so a further re-set (of either kind)
+    /// still finds this path.
+    fn overwriteCreatedListAsScalar(
+        self: *Document,
+        created_key: []const u8,
+        entry: CreatedListEntry,
+        raw: []const u8,
+    ) DocumentError!void {
+        const owned_raw = try self.arena.dupe(u8, raw);
+        try self.created.ensureUnusedCapacity(self.arena, 1);
+        var idx: usize = 0;
+        while (self.splices.items[idx].seq != entry.seq) idx += 1;
+        const old_text = self.splices.items[idx].text;
+        const block = try self.buildEntryBlock(entry.leading, entry.indent, entry.key, &.{raw});
+        self.splices.items[idx].text = block.text;
+        self.refreshView() catch |e| {
+            self.splices.items[idx].text = old_text;
+            return e;
+        };
+        _ = self.created_lists.remove(created_key);
+        self.created.putAssumeCapacity(created_key, .{
+            .seq = entry.seq,
+            .leading = entry.leading,
+            .indent = entry.indent,
+            .key = entry.key,
+            .value = block.offsets[0],
             .raw = owned_raw,
         });
     }
@@ -455,6 +526,18 @@ pub const Document = struct {
 
         if (values.len == 0) {
             if (occurrences.len == 0) {
+                // A path created earlier THIS session (either kind) is
+                // invisible to `locateAllOccurrences` (it only scans the
+                // frozen `self.source`), so an empty-list re-set on it must
+                // be resolved here instead of falling through to the no-op
+                // below -- otherwise the earlier create's line(s) would be
+                // silently left behind instead of removed.
+                if (self.created.get(created_key)) |entry| {
+                    return self.clearCreatedScalar(created_key, entry);
+                }
+                if (self.created_lists.get(created_key)) |entry| {
+                    return self.clearCreatedList(created_key, entry);
+                }
                 // A no-op ONLY when the path genuinely names nothing yet; a
                 // path already shadowed by an existing section fails the
                 // exact same way a non-empty list's create would (see
@@ -501,13 +584,19 @@ pub const Document = struct {
     /// `setLiteralSegments`'s own create-then-cache handling, but against
     /// `created_lists` instead of `created` since a list create's splice
     /// text may need a different number of lines on a later re-set (see
-    /// `CreatedListEntry`).
+    /// `CreatedListEntry`). A path created earlier this session as a SCALAR
+    /// (`created`) is checked first: rather than appending a second,
+    /// duplicate backing for the same path, the prior scalar create's line
+    /// is expanded into this one list's lines in place.
     fn createListSegments(
         self: *Document,
         segments: []const []const u8,
         created_key: []const u8,
         values: []const []const u8,
     ) DocumentError!void {
+        if (self.created.get(created_key)) |entry| {
+            return self.overwriteCreatedScalarAsList(created_key, entry, values);
+        }
         if (self.created_lists.get(created_key)) |entry| {
             if (itemsEqual(entry.raw, values)) return;
             return self.overwriteCreatedListValue(created_key, entry, values);
@@ -552,6 +641,75 @@ pub const Document = struct {
             .items = block.offsets,
             .raw = values,
         });
+    }
+
+    /// Cross-kind counterpart of `overwriteCreatedListValue`: `path` was
+    /// created earlier this session as a SCALAR (`created`) and is now being
+    /// re-set as a list. Rebuilds the same splice (found by `entry.seq`,
+    /// reusing its `leading`/`indent`/`key`) as `values.len` lines via
+    /// `buildEntryBlock`, rather than leaving the old scalar line in place
+    /// and appending a new list block alongside it. Bookkeeping moves from
+    /// `created` to `created_lists` so a further re-set (of either kind)
+    /// still finds this path. `values` is never empty here -- an empty list
+    /// on a source-miss is handled by `setListSegments` itself, via
+    /// `clearCreatedScalar`, before this is ever reached.
+    fn overwriteCreatedScalarAsList(
+        self: *Document,
+        created_key: []const u8,
+        entry: CreatedEntry,
+        values: []const []const u8,
+    ) DocumentError!void {
+        try self.created_lists.ensureUnusedCapacity(self.arena, 1);
+        var idx: usize = 0;
+        while (self.splices.items[idx].seq != entry.seq) idx += 1;
+        const old_text = self.splices.items[idx].text;
+        const block = try self.buildEntryBlock(entry.leading, entry.indent, entry.key, values);
+        self.splices.items[idx].text = block.text;
+        self.refreshView() catch |e| {
+            self.splices.items[idx].text = old_text;
+            return e;
+        };
+        _ = self.created.remove(created_key);
+        self.created_lists.putAssumeCapacity(created_key, .{
+            .seq = entry.seq,
+            .leading = entry.leading,
+            .indent = entry.indent,
+            .key = entry.key,
+            .items = block.offsets,
+            .raw = values,
+        });
+    }
+
+    /// Clear a path created earlier this session as a SCALAR (`created`),
+    /// entirely, for an empty-list re-set on a source-miss (see
+    /// `setListSegments`): the created line's splice `text` is blanked out
+    /// (rather than rebuilt) so the line disappears from `emit` output, and
+    /// the path's bookkeeping is dropped so a further `set`/`setValueSegments`
+    /// on it takes the genuinely-fresh create path again.
+    fn clearCreatedScalar(self: *Document, created_key: []const u8, entry: CreatedEntry) DocumentError!void {
+        var idx: usize = 0;
+        while (self.splices.items[idx].seq != entry.seq) idx += 1;
+        const old_text = self.splices.items[idx].text;
+        self.splices.items[idx].text = "";
+        self.refreshView() catch |e| {
+            self.splices.items[idx].text = old_text;
+            return e;
+        };
+        _ = self.created.remove(created_key);
+    }
+
+    /// `clearCreatedScalar`'s counterpart for a path created earlier this
+    /// session as a LIST (`created_lists`).
+    fn clearCreatedList(self: *Document, created_key: []const u8, entry: CreatedListEntry) DocumentError!void {
+        var idx: usize = 0;
+        while (self.splices.items[idx].seq != entry.seq) idx += 1;
+        const old_text = self.splices.items[idx].text;
+        self.splices.items[idx].text = "";
+        self.refreshView() catch |e| {
+            self.splices.items[idx].text = old_text;
+            return e;
+        };
+        _ = self.created_lists.remove(created_key);
     }
 
     /// Delete the whole line containing `path`. Never creates.
@@ -864,117 +1022,14 @@ pub const Document = struct {
 
     /// Create and append the key (and its section/subsection, if missing)
     /// named by `segments`. Called only after `locateSegments` has already
-    /// missed, so `segments` is known not to resolve today.
-    fn insertSegments(self: *Document, segments: []const []const u8, raw: []const u8) DocumentError!ValueOffset {
-        const max_depth = self.maxDepth();
-        if (segments.len == 0 or segments.len > max_depth) return error.PathNotFound;
-        const key = segments[segments.len - 1];
-        try self.validateKeyText(key);
-
-        if (segments.len == 1) {
-            if (!self.options.dialect.global_keys) return error.PathNotFound;
-            // A root-level `.section` entry (an existing `[key]` header) of the
-            // same name would otherwise be silently shadowed by the new global
-            // key, since both share the root entries list but never dedupe
-            // against each other. A scalar collision can't reach here: it
-            // would already have been found (and handled) by `locateSegments`.
-            // `key` is folded the same way the parser would store it as a key,
-            // so a case-only collision (e.g. an existing `[x]` and a new
-            // global key `X` under a case-folding dialect) is caught too --
-            // `findValue` matches the already-folded existing entries exactly.
-            if (self.parsed.section.findValue(try self.foldedKey(key))) |existing| {
-                if (existing == .section) return error.InvalidValue;
-            }
-            return self.insertGlobalKey(key, raw);
-        }
-
-        const container = segments[0 .. segments.len - 1];
-        try self.validateSectionName(container[0], container.len == 2);
-        if (container.len == 2) try validateSubsectionName(container[1]);
-
-        if (try self.resolveContainer(container)) |section| {
-            // Same shadowing guard, one level down: `key` may already name a
-            // subsection within `section` (only possible when `container` is
-            // the top-level section, since a subsection's own entries are
-            // always scalars). Only `key` folds here -- a subsection name is
-            // always stored case-sensitively (see `openHeader` in parser.zig),
-            // never folded by `case_insensitive_sections`.
-            if (section.findValue(try self.foldedKey(key))) |existing| {
-                if (existing == .section) return error.InvalidValue;
-            }
-            return self.insertKeyIntoSection(container, section, key, raw);
-        }
-        return self.appendNewSection(container, key, raw);
-    }
-
-    /// Append a root-level (global) key: after the last existing global key,
-    /// or at the very start of the document if there are none (global keys
-    /// must precede every section header). Unindented.
-    fn insertGlobalKey(self: *Document, key: []const u8, raw: []const u8) DocumentError!ValueOffset {
-        var last_key: ?[]const u8 = null;
-        for (self.parsed.section.entries) |e| {
-            if (e.value == .section) break;
-            last_key = e.key;
-        }
-        var at: usize = 0;
-        if (last_key) |lk| {
-            const a = self.anchorsForSpan(self.spans.get(lk).?);
-            at = a.line_end;
-        }
-        const leading = leadingNewlineIfNeeded(self.source, at);
-        const line = try std.fmt.allocPrint(self.arena, "{s}{s} {c} {s}{s}", .{
-            leading, key, self.assignChar(), raw, dominantEol(self.source),
-        });
-        try self.recordSplice(at, at, line);
-        const value_start = leading.len + key.len + 3;
-        return .{ .start = value_start, .end = value_start + raw.len };
-    }
-
-    /// Append `key` into an already-resolved, existing `section`: after its
-    /// last SCALAR entry (mirroring that entry's indentation) -- a top-level
-    /// section's entries may mix scalars with subsections (e.g. a bare
-    /// `[branch]` block followed by `[branch "main"]`), and only a scalar
-    /// entry has a span to anchor on. With no scalar entry, falls back to
-    /// right after the section's own bare header line (mirroring the first
-    /// indented key found anywhere else in the document, if any); with no
-    /// bare header line either (a top-level section that exists only as
-    /// `[section "sub"]` blocks), falls back to appending a whole new bare
-    /// section, same as a genuinely missing one.
-    fn insertKeyIntoSection(
-        self: *Document,
-        container: []const []const u8,
-        section: *Section,
-        key: []const u8,
-        raw: []const u8,
-    ) DocumentError!ValueOffset {
-        var at: usize = undefined;
-        var indent: []const u8 = undefined;
-        if (lastScalarKey(section)) |last_key| {
-            // Rebuild the sibling's full span-map key the same way `full`
-            // must match what `recordSpan` stored: `container` here is the
-            // caller's raw path (may differ in case from a folded section
-            // name resolveContainer already matched into), so route through
-            // `joinSectionFolded` rather than joining it verbatim.
-            var full_segments: [3][]const u8 = undefined;
-            for (container, 0..) |seg, i| full_segments[i] = seg;
-            full_segments[container.len] = last_key;
-            const full = try self.joinSectionFolded(full_segments[0 .. container.len + 1]);
-            const a = self.anchorsForSpan(self.spans.get(full).?);
-            at = a.line_end;
-            indent = a.indent;
-        } else if (self.headerLineEnd(container)) |end| {
-            at = end;
-            indent = self.prevailingIndent();
-        } else {
-            return self.appendNewSection(container, key, raw);
-        }
-        const leading = leadingNewlineIfNeeded(self.source, at);
-        const line = try std.fmt.allocPrint(self.arena, "{s}{s}{s} {c} {s}{s}", .{
-            leading, indent, key, self.assignChar(), raw, dominantEol(self.source),
-        });
-        try self.recordSplice(at, at, line);
-        const value_start = leading.len + indent.len + key.len + 3;
-        return .{ .start = value_start, .end = value_start + raw.len };
+    /// missed, so `segments` is known not to resolve today. A thin
+    /// single-value wrapper over `insertListSegments` (`&.{raw}`), sharing
+    /// its validation and placement logic entirely: a created scalar's
+    /// `leading`/`indent`/`key` therefore come from the exact same place a
+    /// created list's do, letting `created`'s `CreatedEntry` carry them too
+    /// (see its doc comment), for a same-session cross-kind re-set.
+    fn insertSegments(self: *Document, segments: []const []const u8, raw: []const u8) DocumentError!ListInsertResult {
+        return self.insertListSegments(segments, &.{raw});
     }
 
     /// Key of the last entry in `section` that is a scalar (string/list), not
@@ -991,32 +1046,12 @@ pub const Document = struct {
         return null;
     }
 
-    /// Append a whole new section (or `[section "subsection"]`) plus its one
-    /// key at the end of the document, separated from prior content by
-    /// exactly one blank line (none if the document is empty). This is the
-    /// only place a header line is created, so a subsection is always a full
-    /// new header -- gitconfig has no syntax for adding a subsection to an
-    /// existing `[section]` block.
-    fn appendNewSection(self: *Document, container: []const []const u8, key: []const u8, raw: []const u8) DocumentError!ValueOffset {
-        const nl = dominantEol(self.source);
-        const header = if (container.len == 2) blk: {
-            const sub = try escapeSubsectionName(self.arena, container[1]);
-            break :blk try std.fmt.allocPrint(self.arena, "[{s} \"{s}\"]{s}", .{ container[0], sub, nl });
-        } else try std.fmt.allocPrint(self.arena, "[{s}]{s}", .{ container[0], nl });
-        const sep = newSectionSeparator(self.source);
-        const indent = self.prevailingIndent();
-        const text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}{s} {c} {s}{s}", .{
-            sep, header, indent, key, self.assignChar(), raw, nl,
-        });
-        try self.recordSpliceKind(self.source.len, self.source.len, text, true);
-        const value_start = sep.len + header.len + indent.len + key.len + 3;
-        return .{ .start = value_start, .end = value_start + raw.len };
-    }
-
-    /// `insertGlobalKey`/`insertKeyIntoSection`/`appendNewSection`'s shared
-    /// return shape once they build a multi-line block instead of one line:
-    /// the strings needed to rebuild an equivalent block later (see
-    /// `overwriteCreatedListValue`), plus each item's `ValueOffset`.
+    /// Return shape shared by `insertGlobalKeyList`/`insertKeyIntoSectionList`/
+    /// `appendNewSectionList` once they build a multi-line block (or, via
+    /// `insertSegments`'s single-value wrapper, a one-line block): the
+    /// strings needed to rebuild an equivalent block later (see
+    /// `overwriteCreatedListValue`/`overwriteCreatedScalarAsList`), plus each
+    /// item's `ValueOffset`.
     const ListInsertResult = struct {
         leading: []const u8,
         indent: []const u8,
@@ -1025,10 +1060,11 @@ pub const Document = struct {
     };
 
     /// Build a multi-line `key = value` block, one line per item, all
-    /// sharing `key` and `indent`, prefixed by `leading` -- the list
-    /// counterpart of the single-line text `insertGlobalKey`/
-    /// `insertKeyIntoSection`/`appendNewSection` build inline. Returns the
-    /// block text plus each item's `ValueOffset` within it, in order.
+    /// sharing `key` and `indent`, prefixed by `leading` -- shared by
+    /// `insertGlobalKeyList`/`insertKeyIntoSectionList`/`appendNewSectionList`
+    /// (and, via `insertSegments`'s single-value wrapper, its own one-line
+    /// case). Returns the block text plus each item's `ValueOffset` within
+    /// it, in order.
     fn buildEntryBlock(
         self: *Document,
         leading: []const u8,
@@ -1054,11 +1090,11 @@ pub const Document = struct {
         return .{ .text = buf.items, .offsets = offsets };
     }
 
-    /// `insertSegments`'s list counterpart: create and append `key` (and its
-    /// section/subsection, if missing) as a block of `values.len` lines
-    /// instead of one. Mirrors `insertSegments`'s validation and branching
-    /// exactly, dispatching to the list variant of whichever placement it
-    /// would have used.
+    /// Create and append `key` (and its section/subsection, if missing) as a
+    /// block of `values.len` lines. `insertSegments` is a thin single-value
+    /// wrapper around this (`&.{raw}`, see its doc comment): every scalar
+    /// create shares this same validation and placement logic with a list
+    /// create, rather than duplicating it.
     fn insertListSegments(self: *Document, segments: []const []const u8, values: []const []const u8) DocumentError!ListInsertResult {
         try self.validateCreatablePath(segments);
         const key = segments[segments.len - 1];
@@ -1104,7 +1140,11 @@ pub const Document = struct {
         }
     }
 
-    /// `insertGlobalKey`'s list counterpart.
+    /// Append a root-level (global) key as a block of `values.len` lines:
+    /// after the last existing global key, or at the very start of the
+    /// document if there are none (global keys must precede every section
+    /// header). Unindented. Shared by `insertSegments` (a single-value
+    /// wrapper) and `insertListSegments`.
     fn insertGlobalKeyList(self: *Document, key: []const u8, values: []const []const u8) DocumentError!ListInsertResult {
         var last_key: ?[]const u8 = null;
         for (self.parsed.section.entries) |e| {
@@ -1122,7 +1162,18 @@ pub const Document = struct {
         return .{ .leading = leading, .indent = "", .key = key, .offsets = block.offsets };
     }
 
-    /// `insertKeyIntoSection`'s list counterpart.
+    /// Append `key` into an already-resolved, existing `section`, as a block
+    /// of `values.len` lines: after its last SCALAR entry (mirroring that
+    /// entry's indentation) -- a top-level section's entries may mix scalars
+    /// with subsections (e.g. a bare `[branch]` block followed by
+    /// `[branch "main"]`), and only a scalar entry has a span to anchor on.
+    /// With no scalar entry, falls back to right after the section's own
+    /// bare header line (mirroring the first indented key found anywhere
+    /// else in the document, if any); with no bare header line either (a
+    /// top-level section that exists only as `[section "sub"]` blocks),
+    /// falls back to appending a whole new bare section, same as a
+    /// genuinely missing one. Shared by `insertSegments` (a single-value
+    /// wrapper) and `insertListSegments`.
     fn insertKeyIntoSectionList(
         self: *Document,
         container: []const []const u8,
@@ -1152,7 +1203,13 @@ pub const Document = struct {
         return .{ .leading = leading, .indent = indent, .key = key, .offsets = block.offsets };
     }
 
-    /// `appendNewSection`'s list counterpart.
+    /// Append a whole new section (or `[section "subsection"]`) plus a block
+    /// of `values.len` lines at the end of the document, separated from
+    /// prior content by exactly one blank line (none if the document is
+    /// empty). This is the only place a header line is created, so a
+    /// subsection is always a full new header -- gitconfig has no syntax for
+    /// adding a subsection to an existing `[section]` block. Shared by
+    /// `insertSegments` (a single-value wrapper) and `insertListSegments`.
     fn appendNewSectionList(self: *Document, container: []const []const u8, key: []const u8, values: []const []const u8) DocumentError!ListInsertResult {
         const nl = dominantEol(self.source);
         const header = if (container.len == 2) blk: {
@@ -2772,7 +2829,7 @@ test "CREATE: a case-folded collision with an existing section is caught, not ju
         try testing.expectEqualStrings(src, aw.written());
     }
     // A genuinely distinct root key still succeeds. Global keys must precede
-    // every section header (see insertGlobalKey), so it lands at the start.
+    // every section header (see insertGlobalKeyList), so it lands at the start.
     {
         var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
         try doc.set("y", @as([]const u8, "2"));
@@ -3124,6 +3181,100 @@ test "MULTIVAL: setValueSegments on a freshly created list path can be re-set to
     try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{ "x", "y" } });
     const out2 = try emitAndReparse(a, &doc, .{ .dialect = G });
     try testing.expectEqualStrings("[s]\n\tk = v\n\tfresh = x\n\tfresh = y\n", out2);
+    const list = doc.getSegments(&.{ "s", "fresh" }).?.list;
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqualStrings("x", list[0]);
+    try testing.expectEqualStrings("y", list[1]);
+}
+
+test "MULTIVAL: a list-create re-set as a scalar collapses in place instead of duplicating (A1 repro 1)" {
+    const G = Dialect.gitconfig;
+    const src = "[s]\n\tk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{ "a", "b", "c" } });
+    try doc.setSegments(&.{ "s", "fresh" }, @as([]const u8, "solo"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[s]\n\tk = v\n\tfresh = solo\n", out);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "\n"));
+    const got = doc.getSegments(&.{ "s", "fresh" }).?;
+    try testing.expect(got == .string);
+    try testing.expectEqualStrings("solo", got.string);
+}
+
+test "MULTIVAL: a scalar-create re-set as a list collapses in place instead of duplicating (A1 repro 2)" {
+    const G = Dialect.gitconfig;
+    const src = "[s]\n\tk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "s", "fresh" }, @as([]const u8, "solo"));
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{ "a", "b" } });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[s]\n\tk = v\n\tfresh = a\n\tfresh = b\n", out);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, "\n"));
+    const list = doc.getSegments(&.{ "s", "fresh" }).?.list;
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqualStrings("a", list[0]);
+    try testing.expectEqualStrings("b", list[1]);
+}
+
+test "MULTIVAL: a scalar-create re-set to an empty list removes the created line (A1 repro 3)" {
+    const G = Dialect.gitconfig;
+    const src = "[s]\n\tk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "s", "fresh" }, @as([]const u8, "solo"));
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{} });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(src, out);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\n"));
+    try testing.expect(doc.getSegments(&.{ "s", "fresh" }) == null);
+}
+
+test "MULTIVAL: a list-create re-set to an empty list removes the created lines" {
+    const G = Dialect.gitconfig;
+    const src = "[s]\n\tk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{ "a", "b" } });
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{} });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(src, out);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\n"));
+    try testing.expect(doc.getSegments(&.{ "s", "fresh" }) == null);
+}
+
+test "MULTIVAL: create then cross-kind then cross-kind-again collapses to the final kind, single-kind bookkeeping" {
+    const G = Dialect.gitconfig;
+    const src = "[s]\n\tk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "s", "fresh" }, @as([]const u8, "solo")); // scalar create
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{ "a", "b", "c" } }); // -> list
+    try doc.setSegments(&.{ "s", "fresh" }, @as([]const u8, "final")); // -> scalar again
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[s]\n\tk = v\n\tfresh = final\n", out);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "\n"));
+    const got = doc.getSegments(&.{ "s", "fresh" }).?;
+    try testing.expect(got == .string);
+    try testing.expectEqualStrings("final", got.string);
+
+    // A further re-set (either kind) still finds the path tracked under
+    // exactly one kind: no stale entry left in the other map to also match.
+    try doc.setValueSegments(&.{ "s", "fresh" }, .{ .list = &.{ "x", "y" } }); // -> list again
+    const out2 = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[s]\n\tk = v\n\tfresh = x\n\tfresh = y\n", out2);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, out2, "\n"));
     const list = doc.getSegments(&.{ "s", "fresh" }).?.list;
     try testing.expectEqual(@as(usize, 2), list.len);
     try testing.expectEqualStrings("x", list[0]);

@@ -65,6 +65,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next re-parse. This mirrors the section-name case fold already applied;
   subsection names remain unaffected, always matched case-sensitively
   regardless of dialect.
+- `Document.setSegments` / `setLiteralSegments` / `setValueSegments`:
+  re-setting a path an earlier edit in the same session already created, as
+  the OTHER kind (a scalar create re-set as a `.list`, or vice versa), now
+  collapses onto that create in place instead of appending a second,
+  duplicate backing for the same path. Previously the two creates were
+  tracked in separate bookkeeping that never consulted each other, so the
+  prior lines were left behind and the new kind's lines were appended
+  alongside them; an empty-list re-set of a scalar create is now a removal
+  (matching how an empty-list re-set of an existing key already behaves)
+  instead of a silent no-op that left the stale line in place. A path is
+  now always tracked under exactly one kind, so a further re-set (of either
+  kind) still finds and rewrites the same splice.
 
 ## [0.3.0] - 2026-07-21
 
