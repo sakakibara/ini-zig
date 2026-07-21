@@ -413,6 +413,18 @@ pub const Document = struct {
         return cur;
     }
 
+    /// Fold `key` the same way the parser will store it once it is written
+    /// as a key: lower-cased under `case_insensitive_keys`, unchanged
+    /// otherwise. Used before a `Section.findValue` shadowing check so the
+    /// comparison matches what a re-parse will actually collide on, instead
+    /// of the byte-exact match `findValue` performs on its own.
+    fn foldedKey(self: *const Document, key: []const u8) Allocator.Error![]const u8 {
+        return if (self.options.dialect.case_insensitive_keys)
+            try parser_mod.toLowerAlloc(self.arena, key)
+        else
+            key;
+    }
+
     /// Create and append the key (and its section/subsection, if missing)
     /// named by `segments`. Called only after `locateSegments` has already
     /// missed, so `segments` is known not to resolve today.
@@ -429,22 +441,28 @@ pub const Document = struct {
             // key, since both share the root entries list but never dedupe
             // against each other. A scalar collision can't reach here: it
             // would already have been found (and handled) by `locateSegments`.
-            if (self.parsed.section.findValue(key)) |existing| {
+            // `key` is folded the same way the parser would store it as a key,
+            // so a case-only collision (e.g. an existing `[x]` and a new
+            // global key `X` under a case-folding dialect) is caught too --
+            // `findValue` matches the already-folded existing entries exactly.
+            if (self.parsed.section.findValue(try self.foldedKey(key))) |existing| {
                 if (existing == .section) return error.InvalidValue;
             }
             return self.insertGlobalKey(key, raw);
         }
 
         const container = segments[0 .. segments.len - 1];
-        try self.validateSectionName(container[0]);
+        try self.validateSectionName(container[0], container.len == 2);
         if (container.len == 2) try validateSubsectionName(container[1]);
 
         if (try self.resolveContainer(container)) |section| {
             // Same shadowing guard, one level down: `key` may already name a
             // subsection within `section` (only possible when `container` is
             // the top-level section, since a subsection's own entries are
-            // always scalars).
-            if (section.findValue(key)) |existing| {
+            // always scalars). Only `key` folds here -- a subsection name is
+            // always stored case-sensitively (see `openHeader` in parser.zig),
+            // never folded by `case_insensitive_sections`.
+            if (section.findValue(try self.foldedKey(key))) |existing| {
                 if (existing == .section) return error.InvalidValue;
             }
             return self.insertKeyIntoSection(container, section, key, raw);
@@ -466,8 +484,8 @@ pub const Document = struct {
             const a = self.anchorsForSpan(self.spans.get(lk).?);
             at = a.line_end;
         }
-        const line = try std.fmt.allocPrint(self.arena, "{s}{s} {c} {s}\n", .{
-            leadingNewlineIfNeeded(self.source, at), key, self.assignChar(), raw,
+        const line = try std.fmt.allocPrint(self.arena, "{s}{s} {c} {s}{s}", .{
+            leadingNewlineIfNeeded(self.source, at), key, self.assignChar(), raw, dominantEol(self.source),
         });
         return self.recordSplice(at, at, line);
     }
@@ -503,8 +521,8 @@ pub const Document = struct {
         } else {
             return self.appendNewSection(container, key, raw);
         }
-        const line = try std.fmt.allocPrint(self.arena, "{s}{s}{s} {c} {s}\n", .{
-            leadingNewlineIfNeeded(self.source, at), indent, key, self.assignChar(), raw,
+        const line = try std.fmt.allocPrint(self.arena, "{s}{s}{s} {c} {s}{s}", .{
+            leadingNewlineIfNeeded(self.source, at), indent, key, self.assignChar(), raw, dominantEol(self.source),
         });
         return self.recordSplice(at, at, line);
     }
@@ -530,12 +548,13 @@ pub const Document = struct {
     /// new header -- gitconfig has no syntax for adding a subsection to an
     /// existing `[section]` block.
     fn appendNewSection(self: *Document, container: []const []const u8, key: []const u8, raw: []const u8) DocumentError!void {
+        const nl = dominantEol(self.source);
         const header = if (container.len == 2) blk: {
             const sub = try escapeSubsectionName(self.arena, container[1]);
-            break :blk try std.fmt.allocPrint(self.arena, "[{s} \"{s}\"]\n", .{ container[0], sub });
-        } else try std.fmt.allocPrint(self.arena, "[{s}]\n", .{container[0]});
-        const text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}{s} {c} {s}\n", .{
-            newSectionSeparator(self.source), header, self.prevailingIndent(), key, self.assignChar(), raw,
+            break :blk try std.fmt.allocPrint(self.arena, "[{s} \"{s}\"]{s}", .{ container[0], sub, nl });
+        } else try std.fmt.allocPrint(self.arena, "[{s}]{s}", .{ container[0], nl });
+        const text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}{s} {c} {s}{s}", .{
+            newSectionSeparator(self.source), header, self.prevailingIndent(), key, self.assignChar(), raw, nl,
         });
         return self.recordSplice(self.source.len, self.source.len, text);
     }
@@ -598,16 +617,19 @@ pub const Document = struct {
     }
 
     /// Reject a section (or plain, non-subsection header) name that would not
-    /// survive a re-parse as the SAME name: empty, a line break, edge
-    /// whitespace (a quoted-subsection header always trims the outer name,
-    /// regardless of `trim_section_names`), an embedded `"` under a
-    /// subsection-quoting dialect (would be misread as opening a subsection),
-    /// or an invalid git section-name charset.
-    fn validateSectionName(self: *const Document, name: []const u8) DocumentError!void {
+    /// survive a re-parse as the SAME name: empty, a line break, an embedded
+    /// `"` under a subsection-quoting dialect (would be misread as opening a
+    /// subsection), an invalid git section-name charset, or edge whitespace
+    /// that would actually be trimmed away on re-parse. A quoted-subsection
+    /// header (`has_subsection`) always trims its outer name, regardless of
+    /// `trim_section_names`; a plain header only trims when the dialect does
+    /// (`generic`'s `trim_section_names = false` makes `[ s ]` a legitimately
+    /// distinct, round-tripping section there).
+    fn validateSectionName(self: *const Document, name: []const u8, has_subsection: bool) DocumentError!void {
         if (name.len == 0) return error.MalformedSectionHeader;
         if (hasNewline(name)) return error.UnrepresentableValue;
-        if (edgeWhitespace(name)) return error.UnrepresentableValue;
         const d = self.options.dialect;
+        if ((has_subsection or d.trim_section_names) and edgeWhitespace(name)) return error.UnrepresentableValue;
         if (d.subsections == .quoted and std.mem.indexOfScalar(u8, name, '"') != null) return error.UnrepresentableValue;
         if (d.quoting == .git and !parser_mod.validGitSectionName(name)) return error.MalformedSectionHeader;
     }
@@ -802,24 +824,40 @@ fn escapeSubsectionName(arena: Allocator, name: []const u8) Allocator.Error![]co
     return out.items;
 }
 
+/// The line terminator `source` uses, so freshly appended lines mirror it
+/// instead of always emitting a bare `\n` (which would mix line endings into
+/// a CRLF source). Detected from the LAST newline in the source: `"\r\n"`
+/// when it is preceded by a carriage return, `"\n"` otherwise -- also the
+/// default for a source with no newline at all.
+fn dominantEol(source: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, source, '\n')) |i| {
+        if (i > 0 and source[i - 1] == '\r') return "\r\n";
+    }
+    return "\n";
+}
+
 /// Leading bytes to prepend before a brand-new section header so it starts
 /// its own paragraph: no separator for an empty document (nothing precedes
 /// it), one blank line when the document already ends in one, two newlines
-/// (terminate the dangling last line, then a blank line) otherwise.
+/// (terminate the dangling last line, then a blank line) otherwise. Mirrors
+/// `source`'s line terminator; a blank-line check that only looked for
+/// `"\n\n"` would miss a CRLF source's `"\r\n\r\n"` (whose last two bytes are
+/// `"\r\n"`, not `"\n\n"`) and double up the blank line.
 fn newSectionSeparator(source: []const u8) []const u8 {
     if (source.len == 0) return "";
-    if (std.mem.endsWith(u8, source, "\n\n")) return "";
-    if (std.mem.endsWith(u8, source, "\n")) return "\n";
-    return "\n\n";
+    if (std.mem.endsWith(u8, source, "\n\n") or std.mem.endsWith(u8, source, "\r\n\r\n")) return "";
+    const crlf = std.mem.eql(u8, dominantEol(source), "\r\n");
+    if (std.mem.endsWith(u8, source, "\n")) return if (crlf) "\r\n" else "\n";
+    return if (crlf) "\r\n\r\n" else "\n\n";
 }
 
-/// A single `\n` to prepend when `at` does not already sit right after a
-/// newline (or at the very start of the source), so text inserted there
-/// starts its own line instead of running onto a dangling, unterminated
-/// prior line.
+/// A single line terminator (mirroring `source`'s) to prepend when `at` does
+/// not already sit right after a newline (or at the very start of the
+/// source), so text inserted there starts its own line instead of running
+/// onto a dangling, unterminated prior line.
 fn leadingNewlineIfNeeded(source: []const u8, at: usize) []const u8 {
     if (at == 0 or source[at - 1] == '\n') return "";
-    return "\n";
+    return dominantEol(source);
 }
 
 /// Ordering for the splice list: by start, then insertions (zero-width) before
@@ -1893,4 +1931,139 @@ test "CREATE: a new key colliding with an existing section/subsection name is In
         try doc.emit(&aw.writer);
         try testing.expectEqualStrings(src, aw.written());
     }
+}
+
+test "CREATE: a case-folded collision with an existing section is caught, not just an exact-case one (root level)" {
+    // generic folds both section and key names, so "X" and the existing "[x]"
+    // section collide once stored, even though they differ in source case.
+    const src = "[x]\nk = v\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Exact case still rejected (pre-existing guard).
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
+        try testing.expectError(error.InvalidValue, doc.set("x", @as([]const u8, "direct")));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings(src, aw.written());
+    }
+    // Case-mismatched collision: "X" folds to "x" the same way the parser
+    // would store it, so it must be rejected too instead of silently
+    // shadowing "[x]" on re-parse.
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
+        try testing.expectError(error.InvalidValue, doc.set("X", @as([]const u8, "2")));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings(src, aw.written());
+    }
+    // A genuinely distinct root key still succeeds. Global keys must precede
+    // every section header (see insertGlobalKey), so it lands at the start.
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.generic });
+        try doc.set("y", @as([]const u8, "2"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.generic });
+        try testing.expectEqualStrings("y = 2\n[x]\nk = v\n", out);
+    }
+}
+
+test "CREATE: a case-folded collision with an existing subsection is caught (nested level, gitconfig)" {
+    // gitconfig folds keys but stores subsection names case-sensitively (see
+    // openHeader in parser.zig), so "MAIN" must still be folded to "main"
+    // before comparing against the subsection, catching the collision the
+    // parser's own case-folding would create on re-parse.
+    const G = Dialect.gitconfig;
+    const src = "[branch \"main\"]\n\tmerge = refs/heads/main\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Exact case still rejected (pre-existing guard, also covered above).
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try testing.expectError(error.InvalidValue, doc.set("branch.main", @as([]const u8, "direct")));
+    }
+    // Case-mismatched collision.
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try testing.expectError(error.InvalidValue, doc.set("branch.MAIN", @as([]const u8, "direct2")));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings(src, aw.written());
+    }
+    // A genuinely distinct key under the same top-level section still succeeds.
+    {
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try doc.set("branch.other", @as([]const u8, "x"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+        const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
+        try testing.expectEqualStrings("x", v2.getSegments(&.{ "branch", "other" }).?.string);
+        try testing.expectEqualStrings("refs/heads/main", v2.get("branch.main.merge").?.string);
+    }
+}
+
+test "CREATE: a brand-new section on a CRLF source uses CRLF throughout, with no doubled blank line" {
+    // A dangling (non-blank-terminated) CRLF source: the separator must
+    // become a CRLF blank line, not a bare "\n\n".
+    {
+        const src = "[a]\r\nx = 1\r\n";
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+        try doc.set("b.y", @as([]const u8, "2"));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("[a]\r\nx = 1\r\n\r\n[b]\r\ny = 2\r\n", aw.written());
+        const v2 = try parser_mod.parse(a, aw.written(), .{ .dialect = Dialect.strict });
+        try testing.expectEqualStrings("2", v2.get("b.y").?.string);
+    }
+    // A CRLF source already ending in a blank line ("\r\n\r\n"): the old
+    // endsWith(source, "\n\n") check missed this (last two bytes are "\r\n",
+    // not "\n\n") and inserted a second blank line. Must stay single.
+    {
+        const src = "[a]\r\nx = 1\r\n\r\n";
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+        try doc.set("b.y", @as([]const u8, "2"));
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("[a]\r\nx = 1\r\n\r\n[b]\r\ny = 2\r\n", aw.written());
+        const v2 = try parser_mod.parse(a, aw.written(), .{ .dialect = Dialect.strict });
+        try testing.expectEqualStrings("2", v2.get("b.y").?.string);
+    }
+}
+
+test "CREATE: a brand-new section on an LF source still uses bare LF" {
+    const src = "[a]\nx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc.set("b.y", @as([]const u8, "2"));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[a]\nx = 1\n\n[b]\ny = 2\n", aw.written());
+    try testing.expect(std.mem.indexOfScalar(u8, aw.written(), '\r') == null);
+}
+
+test "CREATE: a section name with edge whitespace round-trips under a non-trimming dialect (generic)" {
+    // generic sets trim_section_names = false, so "[ s ]" and "[s]" are
+    // legitimately distinct, representable sections there; the create path
+    // must not over-reject the edge whitespace the way a trimming dialect
+    // (which would actually strip it, changing the name) rightly does.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.empty(a, .{ .dialect = Dialect.generic });
+    try doc.setSegments(&.{ " s ", "key" }, @as([]const u8, "v"));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[ s ]\nkey = v\n", aw.written());
+    const v2 = try parser_mod.parse(a, aw.written(), .{ .dialect = Dialect.generic });
+    try testing.expectEqualStrings("v", v2.getSegments(&.{ " s ", "key" }).?.string);
 }

@@ -775,7 +775,7 @@ pub fn stripInlineComment(value: []const u8, comment_chars: []const u8) []const 
 
 /// Return a lowercase copy of `s` allocated in `arena`, or `s` unchanged when
 /// it is already all-lowercase (zero-copy fast path).
-fn toLowerAlloc(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+pub fn toLowerAlloc(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     for (s) |c| {
         if (c >= 'A' and c <= 'Z') {
             const buf = try arena.alloc(u8, s.len);

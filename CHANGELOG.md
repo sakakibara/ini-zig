@@ -28,7 +28,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in an existing section is appended to it. This is the one intentional
   behavior change; every other case (an existing path, a genuinely over-deep
   path, a container segment that already names a non-section value) is
-  unchanged.
+  unchanged. The new-key/new-section collision guard folds names the same
+  way the parser would store them, so a case-only collision under a
+  case-folding dialect is rejected instead of silently shadowing the
+  existing section on re-parse; appended lines and separators mirror the
+  source's line terminator, so a CRLF document stays CRLF instead of picking
+  up mixed line endings or a doubled blank line; and a section name is only
+  rejected for edge whitespace when the dialect would actually trim it away,
+  so `[ s ]` remains creatable under a dialect (e.g. `generic`) that keeps
+  section-name whitespace significant.
 
 ## [0.2.0] - 2026-07-05
 
