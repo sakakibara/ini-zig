@@ -86,6 +86,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   occurrence was spliced in place, leaving the key's other lines stale and
   the read-back a list instead of the intended scalar. A key with a single
   occurrence is unaffected.
+- `Document.remove` / `set` / `setLiteral` (the dotted-STRING path API):
+  addressing a gitconfig subsection whose own name contains a `.` (e.g.
+  `branch.feature.x.merge` for `[branch "feature.x"]`) no longer resolves the
+  wrong container. The dotted string over-segments into more parts than the
+  dialect's section/subsection/key shape has, and the multi-occurrence
+  scanner used to reconstruct a truncated container from those parts (e.g.
+  the bare `[branch]` section instead of the `"feature.x"` subsection),
+  either missing the path entirely (`error.PathNotFound`) or editing a
+  same-named key in the wrong section. Such an over-segmented path now falls
+  back to the single anchor its raw dotted span resolves to, matching how it
+  already worked before multi-occurrence scanning was added. The
+  segments-array API (e.g. `&.{"branch", "feature.x", "merge"}`), which
+  addresses the subsection as its own segment, is unaffected and continues
+  to scan every occurrence correctly.
 
 ## [0.3.0] - 2026-07-21
 

@@ -843,9 +843,25 @@ pub const Document = struct {
     /// treats it as one), so this delegates to plain `locateSegments` and
     /// returns at most the one occurrence it already resolves -- preserving
     /// `removeSegments`'s existing single-line behavior there exactly.
+    ///
+    /// Also gated on `segments` being no deeper than `maxDepth` (section,
+    /// optional subsection, key): a dotted-STRING path addressing a
+    /// subsection whose own name contains a `.` (e.g. `branch.feature.x.merge`
+    /// for gitconfig's `[branch "feature.x"]`) over-segments into MORE parts
+    /// than the dialect's header shape has, so `container = segments[0..len-1]`
+    /// no longer names a reconstructable section(+subsection) -- `locateSegments`
+    /// resolves such a path only via its raw dot-joined span-map key (the
+    /// same anchor the parser itself stored it under), and there is no way to
+    /// walk the source scanning for "every occurrence in that container"
+    /// because the container itself cannot be rebuilt from the segments. This
+    /// falls back to that single dot-joined anchor instead of scanning a
+    /// truncated (and therefore wrong) container. The segments-ARRAY API
+    /// (e.g. `&.{"branch", "feature.x", "merge"}`) is unaffected: there the
+    /// subsection is already its own segment, so `segments.len` stays within
+    /// `maxDepth` and multi-occurrence scanning below still applies.
     fn locateAllOccurrences(self: *const Document, segments: []const []const u8) DocumentError![]Anchors {
         if (segments.len == 0) return &.{};
-        if (self.options.dialect.duplicate_keys != .accumulate) {
+        if (self.options.dialect.duplicate_keys != .accumulate or segments.len > self.maxDepth()) {
             const a = try self.locateSegments(segments) orelse return &.{};
             const out = try self.arena.alloc(Anchors, 1);
             out[0] = a;
@@ -3404,4 +3420,100 @@ test "MULTIVAL: a scalar set on a multi-value key preserves a trailing comment a
     );
     try testing.expectEqualStrings("u", doc.getSegments(&.{ "remote", "o", "url" }).?.string);
     try testing.expectEqualStrings("v", doc.getSegments(&.{ "remote", "o", "other" }).?.string);
+}
+
+test "MULTIVAL: removeSegments on an over-segmented dotted-subsection path removes the subsection line" {
+    const G = Dialect.gitconfig;
+    const src = "[branch \"feature.x\"]\n\tmerge = refs/heads/main\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.remove("branch.feature.x.merge");
+    try testing.expect(doc.get("branch.feature.x.merge") == null);
+    try testing.expect(doc.getSegments(&.{ "branch", "feature.x", "merge" }) == null);
+}
+
+test "MULTIVAL: removeSegments on an over-segmented dotted-subsection path leaves an unrelated same-key section untouched" {
+    const G = Dialect.gitconfig;
+    const src = "[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n\tmerge = target\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.remove("branch.feature.x.merge");
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n", out);
+}
+
+test "MULTIVAL: setLiteral on an over-segmented dotted-subsection path sets only the subsection line" {
+    const G = Dialect.gitconfig;
+    const src = "[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n\tmerge = target\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.set("branch.feature.x.merge", @as([]const u8, "NEW"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(
+        "[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n\tmerge = NEW\n",
+        out,
+    );
+}
+
+test "MULTIVAL: a genuinely multi-value dotted-subsection key still collapses/removes via segments" {
+    const G = Dialect.gitconfig;
+    const src = "[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n\tmerge = one\n\tmerge = two\n\tmerge = three\n";
+    // The segments-array API addresses the subsection container directly
+    // ({branch,"feature.x"}, depth 2) rather than over-segmenting it via a
+    // raw dotted string, so multi-occurrence scanning applies normally.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try doc.setSegments(&.{ "branch", "feature.x", "merge" }, @as([]const u8, "solo"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+        try testing.expectEqualStrings(
+            "[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n\tmerge = solo\n",
+            out,
+        );
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try doc.removeSegments(&.{ "branch", "feature.x", "merge" });
+        const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+        try testing.expectEqualStrings("[branch]\n\tmerge = a\n\tmerge = b\n[branch \"feature.x\"]\n", out);
+        try testing.expectEqualStrings("a", doc.getSegments(&.{ "branch", "merge" }).?.list[0]);
+        try testing.expectEqualStrings("b", doc.getSegments(&.{ "branch", "merge" }).?.list[1]);
+    }
+}
+
+test "MULTIVAL: normal 2-segment and 3-segment multi-value collapse/remove are unchanged by the over-segmentation guard" {
+    const G = Dialect.gitconfig;
+    // 3-segment (section+subsection+key), already covered above by the
+    // "remote.o.push" tests; this covers the 2-segment (bare section+key,
+    // no subsection) shape explicitly.
+    const src = "[s]\n\tfetch = a\n\tfetch = b\n\tfetch = c\n\turl = u\n";
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try doc.set("s.fetch", @as([]const u8, "solo"));
+        const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+        try testing.expectEqualStrings("[s]\n\tfetch = solo\n\turl = u\n", out);
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var doc = try Document.parse(a, src, .{ .dialect = G });
+        try doc.remove("s.fetch");
+        const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+        try testing.expectEqualStrings("[s]\n\turl = u\n", out);
+    }
 }
