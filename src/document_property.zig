@@ -28,9 +28,24 @@ const ModelEntry = struct {
     value: []const u8,
 };
 
+/// `ModelEntry`'s multi-value counterpart, kept in its OWN list (`GenResult.
+/// list_model`) rather than folded into `model`: every existing scalar-only
+/// check (`genPath`, `runCase`, `checkCaseVariant`) reads `model` and assumes
+/// every entry is a `.string`, so keeping list entries out of it entirely
+/// means those checks need no list-awareness of their own -- only
+/// `checkListValue` ever reads `list_model`.
+const ListModelEntry = struct {
+    segs: [max_segments][]const u8,
+    len: usize,
+    items: []const []const u8,
+};
+
 const GenResult = struct {
     source: []const u8,
     model: []ModelEntry,
+    /// Multi-value keys genuinely present in `source` -- see `ListModelEntry`.
+    /// Only ever non-empty under a `duplicate_keys = .accumulate` dialect.
+    list_model: []ListModelEntry,
     comments: [][]const u8,
     /// Whether `source` uses `\r\n` line endings throughout (see `toCrlf`).
     crlf: bool,
@@ -124,6 +139,16 @@ fn genTargetValue(rng: std.Random) []const u8 {
     return target_values[rng.uintLessThan(usize, target_values.len)];
 }
 
+/// A random list of 0-3 target values, for `checkListValue`: 0 exercises the
+/// empty-list (remove-or-no-op) path, 1 collapses back to a `.string` on
+/// read-back, 2-3 exercise a genuine multi-value `.list`.
+fn genValueList(a: std.mem.Allocator, rng: std.Random) ![]const []const u8 {
+    const n = rng.uintLessThan(usize, 4);
+    const out = try a.alloc([]const u8, n);
+    for (out) |*v| v.* = genTargetValue(rng);
+    return out;
+}
+
 fn recordModel(a: std.mem.Allocator, model: *std.ArrayList(ModelEntry), segs: []const []const u8, value: []const u8) !void {
     for (model.items) |*e| {
         if (e.len == segs.len and segsEqual(e.segs[0..e.len], segs)) {
@@ -170,6 +195,38 @@ fn setAndRecord(
     return fallback;
 }
 
+fn recordListModel(a: std.mem.Allocator, list_model: *std.ArrayList(ListModelEntry), segs: []const []const u8, items: []const []const u8) !void {
+    var entry: ListModelEntry = .{ .segs = undefined, .len = segs.len, .items = items };
+    for (segs, 0..) |s, i| entry.segs[i] = s;
+    try list_model.append(a, entry);
+}
+
+/// `setAndRecord`'s multi-value counterpart: sets `segs` to a `.list` via
+/// `setValueSegments` instead of a scalar via `setSegments`, recording it
+/// into `list_model` -- see that type's doc comment for why it is kept
+/// separate from `model`. Same representability-error fallback discipline.
+fn setAndRecordList(
+    builder: *ini.Document,
+    a: std.mem.Allocator,
+    list_model: *std.ArrayList(ListModelEntry),
+    segs: []const []const u8,
+    items: []const []const u8,
+    ctr: *usize,
+) ![]const []const u8 {
+    if (builder.setValueSegments(segs, .{ .list = items })) |_| {
+        try recordListModel(a, list_model, segs, items);
+        return segs;
+    } else |_| {}
+    const fallback = try a.alloc([]const u8, segs.len);
+    for (fallback) |*s| {
+        ctr.* += 1;
+        s.* = try std.fmt.allocPrint(a, "f{d}", .{ctr.*});
+    }
+    try builder.setValueSegments(fallback, .{ .list = items });
+    try recordListModel(a, list_model, fallback, items);
+    return fallback;
+}
+
 /// Build one top-level section (1-3 direct keys, and under a
 /// subsection-quoting dialect 0-2 subsections of 1-2 keys each) into
 /// `builder`/`model`.
@@ -192,6 +249,7 @@ fn buildOneSection(
     rng: std.Random,
     ctr: *usize,
     model: *std.ArrayList(ModelEntry),
+    list_model: *std.ArrayList(ListModelEntry),
 ) !void {
     const sec_candidate = try candidateName(a, rng, ctr);
     var sec_name: []const u8 = sec_candidate;
@@ -211,9 +269,20 @@ fn buildOneSection(
     while (ki < num_keys) : (ki += 1) {
         const key_name = try uniqueName(a, rng, ctr, used_names.items);
         try used_names.append(a, key_name);
-        const value = safeValue(rng);
         const segs = try a.dupe([]const u8, &.{ sec_name, key_name });
-        const actual = try setAndRecord(builder, a, model, segs, value, ctr);
+        // Under a dialect that accumulates duplicate keys (gitconfig here),
+        // a direct key is sometimes made a genuine multi-value key instead
+        // of a scalar, so the battery also exercises reading/replacing a
+        // multi-value key that was already IN THE SOURCE, not just one
+        // created by the edit under test -- see `checkListValue`.
+        const actual = if (dialect.duplicate_keys == .accumulate and rng.uintLessThan(u8, 100) < 30) blk: {
+            const items = try a.alloc([]const u8, rng.intRangeAtMost(usize, 2, 3));
+            for (items) |*v| v.* = safeValue(rng);
+            break :blk try setAndRecordList(builder, a, list_model, segs, items, ctr);
+        } else blk: {
+            const value = safeValue(rng);
+            break :blk try setAndRecord(builder, a, model, segs, value, ctr);
+        };
         if (first) {
             sec_name = actual[0];
             first = false;
@@ -291,11 +360,12 @@ fn hasBareLf(s: []const u8) bool {
 fn genDoc(a: std.mem.Allocator, dialect: Dialect, rng: std.Random, ctr: *usize) !GenResult {
     var builder = try ini.Document.empty(a, .{ .dialect = dialect });
     var model: std.ArrayList(ModelEntry) = .empty;
+    var list_model: std.ArrayList(ListModelEntry) = .empty;
 
     const num_sections = rng.intRangeAtMost(usize, 1, 3);
     var si: usize = 0;
     while (si < num_sections) : (si += 1) {
-        try buildOneSection(&builder, a, dialect, rng, ctr, &model);
+        try buildOneSection(&builder, a, dialect, rng, ctr, &model, &list_model);
         const snapshot = try emitToOwned(a, &builder);
         builder = try ini.Document.parse(a, snapshot, .{ .dialect = dialect });
     }
@@ -319,7 +389,13 @@ fn genDoc(a: std.mem.Allocator, dialect: Dialect, rng: std.Random, ctr: *usize) 
     const source = if (crlf) try toCrlf(a, lf_source) else lf_source;
     if (crlf) _ = try ini.parse(a, source, .{ .dialect = dialect });
     const comments = try extractComments(a, source, dialect);
-    return .{ .source = source, .model = try model.toOwnedSlice(a), .comments = comments, .crlf = crlf };
+    return .{
+        .source = source,
+        .model = try model.toOwnedSlice(a),
+        .list_model = try list_model.toOwnedSlice(a),
+        .comments = comments,
+        .crlf = crlf,
+    };
 }
 
 fn modelFind(model: []const ModelEntry, path: []const []const u8) ?[]const u8 {
@@ -377,6 +453,74 @@ fn genPath(a: std.mem.Allocator, rng: std.Random, model: []const ModelEntry, dia
         }
     }
     return genFreshPath(a, dialect, rng, ctr);
+}
+
+fn collidesWithListModel(list_model: []const ListModelEntry, p: []const []const u8) bool {
+    for (list_model) |e| {
+        if (segsEqual(e.segs[0..e.len], p)) return true;
+    }
+    return false;
+}
+
+/// A guaranteed-fresh, guaranteed-safe 2-segment path (valid depth for every
+/// accumulate dialect in this battery) that cannot collide with anything --
+/// `genPathAvoidingLists`/`genFreshPathAvoidingLists`'s last resort after
+/// exhausting their retries.
+fn guaranteedFreshPath(a: std.mem.Allocator, ctr: *usize) ![]const []const u8 {
+    ctr.* += 1;
+    const fresh_sec = try std.fmt.allocPrint(a, "gp{d}", .{ctr.*});
+    ctr.* += 1;
+    const fresh_key = try std.fmt.allocPrint(a, "gp{d}", .{ctr.*});
+    return a.dupe([]const u8, &.{ fresh_sec, fresh_key });
+}
+
+/// `genPath`, retried (bounded) to avoid exactly landing on a path
+/// `list_model` already occupies. `genPath`'s "fresh key" branches pick a
+/// key name (via `candidateName`, including the small fixed adversarial
+/// pool) with no knowledge of `list_model` -- which only `checkListValue`
+/// consults -- so an unguarded call could coincidentally collide with a
+/// genuine multi-value key already planted in the source. That matters here
+/// specifically because `runCase`'s SCALAR flow (`setSegments`) is not
+/// equipped to fully collapse an existing multi-value key to one line (only
+/// `setValueSegments` is); it would just splice the LAST occurrence in
+/// place, leaving the key a shorter list instead of the scalar `runCase`
+/// expects.
+fn genPathAvoidingLists(
+    a: std.mem.Allocator,
+    rng: std.Random,
+    model: []const ModelEntry,
+    list_model: []const ListModelEntry,
+    dialect: Dialect,
+    ctr: *usize,
+) ![]const []const u8 {
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        const p = try genPath(a, rng, model, dialect, ctr);
+        if (!collidesWithListModel(list_model, p)) return p;
+    }
+    return guaranteedFreshPath(a, ctr);
+}
+
+/// `genFreshPath`'s counterpart of `genPathAvoidingLists`, for a caller
+/// (`checkResetToDistinctValue`) that specifically needs a path guaranteed
+/// not to already exist -- an unguarded `genFreshPath` has the same
+/// `list_model`-collision risk `genPathAvoidingLists` documents, but the
+/// consequence there is worse: a "fresh create" test whose path secretly
+/// already names an existing multi-value key is not creating anything at
+/// all, invalidating the whole check.
+fn genFreshPathAvoidingLists(
+    a: std.mem.Allocator,
+    rng: std.Random,
+    list_model: []const ListModelEntry,
+    dialect: Dialect,
+    ctr: *usize,
+) ![]const []const u8 {
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        const p = try genFreshPath(a, dialect, rng, ctr);
+        if (!collidesWithListModel(list_model, p)) return p;
+    }
+    return guaranteedFreshPath(a, ctr);
 }
 
 /// Every line of `s`, trimmed the same way `extractComments` trims a
@@ -461,7 +605,7 @@ fn report(
 fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng: std.Random, seed: u64, idx: usize) !void {
     var ctr: usize = 0;
     const gen = try genDoc(a, dialect, rng, &ctr);
-    const path = try genPath(a, rng, gen.model, dialect, &ctr);
+    const path = try genPathAvoidingLists(a, rng, gen.model, gen.list_model, dialect, &ctr);
     const existed_before = modelFind(gen.model, path) != null;
     const is_leaf_case = existed_before or containerExists(gen.model, path);
     const value = genTargetValue(rng);
@@ -585,6 +729,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
 
     try checkCaseVariant(a, dialect, dialect_name, gen, rng, idx, seed);
     try checkResetToDistinctValue(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
+    try checkListValue(a, dialect, dialect_name, gen, path, rng, idx, seed);
 }
 
 /// Case-flip the section (index 0) and leaf key (the last index) of `path`,
@@ -705,7 +850,7 @@ fn checkResetToDistinctValue(
     idx: usize,
     seed: u64,
 ) !void {
-    const path = try genFreshPath(a, dialect, rng, ctr);
+    const path = try genFreshPathAvoidingLists(a, rng, gen.list_model, dialect, ctr);
     var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
         report(dialect_name, idx, seed, gen.source, path, "", null, "reset-distinct: source failed to parse");
         return err;
@@ -739,6 +884,186 @@ fn checkResetToDistinctValue(
     if (got != .string or !std.mem.eql(u8, got.string, "second")) {
         report(dialect_name, idx, seed, gen.source, path, "second", out, "reset-distinct: read-back is not the second value");
         return error.ResetToDistinctValueMismatch;
+    }
+}
+
+/// Every non-`path` entry in `gen.model`/`gen.list_model` must still read
+/// back unchanged in `reparsed` -- `checkListValue`'s invariant 4 (and its
+/// invariant-7 remove-round-trip counterpart), covering both a scalar
+/// sibling and a genuinely pre-existing multi-value (`list_model`) sibling.
+fn checkListSiblings(
+    dialect_name: []const u8,
+    idx: usize,
+    seed: u64,
+    gen: GenResult,
+    path: []const []const u8,
+    items_desc: []const u8,
+    reparsed: Value,
+    out: []const u8,
+    what: []const u8,
+) !void {
+    for (gen.model) |e| {
+        if (segsEqual(e.segs[0..e.len], path)) continue;
+        const gv = reparsed.getSegments(e.segs[0..e.len]) orelse {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out, what);
+            return error.ListSiblingDropped;
+        };
+        if (gv != .string or !std.mem.eql(u8, gv.string, e.value)) {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out, what);
+            return error.ListSiblingCorrupted;
+        }
+    }
+    for (gen.list_model) |e| {
+        if (segsEqual(e.segs[0..e.len], path)) continue;
+        const gv = reparsed.getSegments(e.segs[0..e.len]) orelse {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out, what);
+            return error.ListSiblingDropped;
+        };
+        if (gv != .list or gv.list.len != e.items.len) {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out, what);
+            return error.ListSiblingCorrupted;
+        }
+        for (gv.list, e.items) |g, w| {
+            if (!std.mem.eql(u8, g, w)) {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, out, what);
+                return error.ListSiblingCorrupted;
+            }
+        }
+    }
+}
+
+/// `setValueSegments`' `.list` branch, against its own fresh `Document`, with
+/// a random 0-3 item list. Only meaningful under a `duplicate_keys =
+/// .accumulate` dialect (gitconfig here); every other dialect's parser
+/// collapses repeated lines back to one value regardless of how they were
+/// written, so the read-back-as-`.list` invariant would not hold there and
+/// this is skipped.
+///
+/// The target path is a mix, matching `genPath`'s own "existing leaf / fresh
+/// create" spirit: when `buildOneSection` planted a genuine multi-value key
+/// in the source (`gen.list_model`), often replace ONE OF THOSE (exercising
+/// reading and replacing a key that already had several physical lines);
+/// otherwise fall back to `fallback_path` (the same path `runCase`'s scalar
+/// flow already exercised), covering create and scalar-to-list replace.
+///
+/// Checks the same invariants as the scalar path -- set is total-or-clean,
+/// reparse-clean, read-back exact (a 0-item list reads back absent, a
+/// 1-item list collapses to `.string`, 2+ items round-trip as an
+/// ORDER-preserving `.list`), siblings (scalar AND multi-value) and comments
+/// survive, a repeat set is idempotent, and removing an existing list path
+/// removes every line -- but not invariant 5b (byte-exact-except-value
+/// minimal diff): a list replace may change the line COUNT itself, so "diff
+/// over one value's span" does not apply the way it does to a single scalar
+/// token.
+fn checkListValue(
+    a: std.mem.Allocator,
+    dialect: Dialect,
+    dialect_name: []const u8,
+    gen: GenResult,
+    fallback_path: []const []const u8,
+    rng: std.Random,
+    idx: usize,
+    seed: u64,
+) !void {
+    if (dialect.duplicate_keys != .accumulate) return;
+    const path = if (gen.list_model.len > 0 and rng.uintLessThan(u8, 100) < 40) blk: {
+        const e = gen.list_model[rng.uintLessThan(usize, gen.list_model.len)];
+        break :blk e.segs[0..e.len];
+    } else fallback_path;
+    const items = try genValueList(a, rng);
+    const items_desc = try std.mem.join(a, ",", items);
+
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, path, items_desc, null, "list: source failed to parse");
+        return err;
+    };
+
+    if (doc.setValueSegments(path, .{ .list = items })) |_| {
+        const out1 = try emitToOwned(a, &doc);
+        try assertCrlfPreserved(dialect_name, idx, seed, gen, path, items_desc, out1, "CRLF source gained a bare LF (list set)");
+
+        const reparsed = ini.parse(a, out1, .{ .dialect = dialect }) catch |e| {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: output failed to reparse");
+            return e;
+        };
+
+        // Invariant 3: read-back exact.
+        if (items.len == 0) {
+            if (reparsed.getSegments(path) != null) {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: empty-list path still present");
+                return error.ListEmptyStillPresent;
+            }
+        } else {
+            const got = reparsed.getSegments(path) orelse {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: read-back missing");
+                return error.ListReadBackMissing;
+            };
+            if (items.len == 1) {
+                if (got != .string or !std.mem.eql(u8, got.string, items[0])) {
+                    report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: single-item read-back mismatch");
+                    return error.ListReadBackMismatch;
+                }
+            } else {
+                if (got != .list or got.list.len != items.len) {
+                    report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: read-back not a matching list");
+                    return error.ListReadBackMismatch;
+                }
+                for (got.list, items) |g, w| {
+                    if (!std.mem.eql(u8, g, w)) {
+                        report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: item mismatch or reordered");
+                        return error.ListReadBackMismatch;
+                    }
+                }
+            }
+        }
+
+        // Invariant 4: sibling preservation (scalar and multi-value).
+        try checkListSiblings(dialect_name, idx, seed, gen, path, items_desc, reparsed, out1, "list: sibling dropped or corrupted");
+
+        // Invariant 5: every comment survives, as a whole line.
+        try assertCommentsSurvive(a, dialect_name, idx, seed, gen, path, items_desc, out1, "list: comment dropped");
+
+        // Invariant 6: idempotence.
+        doc.setValueSegments(path, .{ .list = items }) catch |e| {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: idempotent re-apply errored");
+            return e;
+        };
+        const out2 = try emitToOwned(a, &doc);
+        if (!std.mem.eql(u8, out1, out2)) {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: not idempotent");
+            return error.ListNotIdempotent;
+        }
+
+        // Invariant 7: remove round-trip, for a path that now resolves.
+        if (items.len > 0) {
+            var doc_c = ini.Document.parse(a, out1, .{ .dialect = dialect }) catch |e| {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: edited output failed to reparse for remove");
+                return e;
+            };
+            doc_c.removeSegments(path) catch |e| {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, out1, "list: remove errored on an existing list path");
+                return e;
+            };
+            const outc = try emitToOwned(a, &doc_c);
+            try assertCrlfPreserved(dialect_name, idx, seed, gen, path, items_desc, outc, "CRLF source gained a bare LF (list remove)");
+            const reparsed_c = ini.parse(a, outc, .{ .dialect = dialect }) catch |e| {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, outc, "list: post-remove output failed to reparse");
+                return e;
+            };
+            if (reparsed_c.getSegments(path) != null) {
+                report(dialect_name, idx, seed, gen.source, path, items_desc, outc, "list: path still present after remove");
+                return error.ListRemoveIneffective;
+            }
+            try checkListSiblings(dialect_name, idx, seed, gen, path, items_desc, reparsed_c, outc, "list: remove sibling dropped or corrupted");
+            try assertCommentsSurvive(a, dialect_name, idx, seed, gen, path, items_desc, outc, "list: remove comment dropped");
+        }
+    } else |_| {
+        // Invariant 1: set is total-or-clean.
+        const out_after = try emitToOwned(a, &doc);
+        if (!std.mem.eql(u8, out_after, gen.source)) {
+            report(dialect_name, idx, seed, gen.source, path, items_desc, out_after, "list: failed edit did not roll back");
+            return error.ListNotRolledBack;
+        }
     }
 }
 
