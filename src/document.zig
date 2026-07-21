@@ -44,6 +44,7 @@ const escapeGit = escape.escapeGit;
 
 const Value = value_mod.Value;
 const Section = value_mod.Section;
+const SectionEntry = value_mod.Entry;
 const Span = value_mod.Span;
 const Spans = value_mod.Spans;
 const Dialect = dialect_mod.Dialect;
@@ -336,7 +337,32 @@ pub const Document = struct {
     ///   already shadowed by an existing section) -- that still fails the
     ///   same way a non-empty list's create would, rather than silently
     ///   leaving the shadowing section untouched and unmentioned.
-    /// - `.section` is `error.InvalidValue` (a section is not a leaf value).
+    /// - `.section` materializes `segments` as a WHOLE section (`segments.len
+    ///   == 1`) or, under a subsection-quoting dialect, a whole subsection
+    ///   (`segments.len == 2`): every entry of the section value is written
+    ///   under it, in order, each via this same dispatch (so a nested
+    ///   `.string`/`.list`/`.section` entry is handled exactly as it would be
+    ///   at that path directly). A `segments.len` of 0, over-deep, or a
+    ///   2-segment subsection under a non-quoting dialect is
+    ///   `error.PathNotFound`, same as the create rules above; a nested
+    ///   `.section` entry one level past what the dialect can express (a
+    ///   subsection with its own nested section, which no dialect's header
+    ///   syntax supports) is `error.PathNotFound` too, rather than silently
+    ///   dropping its leaves. If `segments` already names an existing
+    ///   section, its entries are MERGED into it (each set as this same
+    ///   dispatch would set that leaf path) instead of appending a duplicate
+    ///   header; otherwise a whole new section (and, for each nested
+    ///   `.section` entry, its own further new subsection) is appended at
+    ///   the end of the document, separated the same way a single created
+    ///   key's section would be. Every entry's key and rendered value is
+    ///   validated up front, before any splice, so a rejected entry anywhere
+    ///   in the tree leaves the document untouched; validation does not
+    ///   re-check the actual re-parse (only `setSegments`/`setListSegments`
+    ///   do that, splice by splice), so on a MERGE with several entries a
+    ///   value that passes validation but still fails re-parse (e.g. one that
+    ///   trips only `refreshView`'s own check) can leave earlier entries in
+    ///   the tree already applied -- a narrower guarantee than a single
+    ///   leaf's set, which is always fully atomic.
     ///
     /// The multi-value line model matches how THIS dialect's parser reads
     /// repeated keys back (`duplicate_keys`): only under `.accumulate` does
@@ -347,7 +373,7 @@ pub const Document = struct {
         return switch (value) {
             .string => |s| self.setSegments(segments, s),
             .list => |items| self.setListSegments(segments, items),
-            .section => error.InvalidValue,
+            .section => |sec| self.setSectionSegments(segments, sec),
         };
     }
 
@@ -614,6 +640,138 @@ pub const Document = struct {
         try self.recordSpliceGroup(ops.items);
     }
 
+    /// `setValueSegments`'s `.section` branch: validate the whole tree `sec`
+    /// roots (see `validateSectionValue`) before touching anything, then
+    /// apply it (see `applySectionValue`).
+    fn setSectionSegments(self: *Document, segments: []const []const u8, sec: *const Section) DocumentError!void {
+        try self.validateSectionValue(segments, sec);
+        return self.applySectionValue(segments, sec);
+    }
+
+    /// Recursively validate that `sec` can be materialized at `segments` (a
+    /// section, or under a subsection-quoting dialect a subsection,
+    /// container path -- never including a leaf key) without mutating the
+    /// document: the container itself is a legal depth/name for this
+    /// dialect, every entry's key and rendered value would survive a
+    /// re-parse, a scalar/list entry does not collide with an existing
+    /// nested section of the same name, and a nested `.section` entry is
+    /// itself validated the same way one level deeper (which also, via its
+    /// own `resolveContainer` call, catches the opposite collision: an
+    /// existing scalar/list where the entry wants a section). Read-only, so
+    /// `setSectionSegments` can call it entirely before any splice.
+    fn validateSectionValue(self: *const Document, segments: []const []const u8, sec: *const Section) DocumentError!void {
+        if (segments.len == 0 or segments.len > 2) return error.PathNotFound;
+        if (segments.len == 2 and self.options.dialect.subsections != .quoted) return error.PathNotFound;
+        try self.validateSectionName(segments[0], segments.len == 2);
+        if (segments.len == 2) try validateSubsectionName(segments[1]);
+
+        const existing = try self.resolveContainer(segments);
+
+        for (sec.entries) |entry| {
+            try self.validateKeyText(entry.key);
+            switch (entry.value) {
+                .string => |s| {
+                    try self.checkNoSectionShadow(existing, entry.key);
+                    try self.validateRenderedLeaf(s);
+                },
+                .list => |items| {
+                    try self.checkNoSectionShadow(existing, entry.key);
+                    for (items) |it| try self.validateRenderedLeaf(it);
+                },
+                .section => |nested| {
+                    var full: [3][]const u8 = undefined;
+                    for (segments, 0..) |seg, i| full[i] = seg;
+                    full[segments.len] = entry.key;
+                    try self.validateSectionValue(full[0 .. segments.len + 1], nested);
+                },
+            }
+        }
+    }
+
+    /// `error.InvalidValue` when `existing` already holds a nested section
+    /// under `key`: a scalar/list entry of that same name would silently
+    /// shadow it on read instead, the same collision `validateCreatablePath`
+    /// rejects for a single leaf create.
+    fn checkNoSectionShadow(self: *const Document, existing: ?*Section, key: []const u8) DocumentError!void {
+        const section = existing orelse return;
+        if (section.findValue(try self.foldedKey(key))) |v| {
+            if (v == .section) return error.InvalidValue;
+        }
+    }
+
+    /// Render `raw` the dialect-aware way a scalar `set` would, then apply
+    /// the same structural checks `setLiteralSegments` applies to the
+    /// rendered text before ever recording a splice.
+    fn validateRenderedLeaf(self: *const Document, raw: []const u8) DocumentError!void {
+        const rendered = try self.renderTyped([]const u8, raw);
+        if (hasNewline(rendered)) return error.UnrepresentableValue;
+        if (escape.structureBreakingLiteral(self.options.dialect, rendered)) return error.UnrepresentableValue;
+    }
+
+    /// Apply an already-`validateSectionValue`-validated `sec` at `segments`:
+    /// merge into an existing section/subsection leaf by leaf (reusing
+    /// `setSegments`/`setListSegments`, and this same function recursively
+    /// for a nested `.section` entry), or append a whole new one when it is
+    /// entirely or partially missing.
+    fn applySectionValue(self: *Document, segments: []const []const u8, sec: *const Section) DocumentError!void {
+        if (try self.resolveContainer(segments)) |_| {
+            for (sec.entries) |entry| {
+                var full: [3][]const u8 = undefined;
+                for (segments, 0..) |seg, i| full[i] = seg;
+                full[segments.len] = entry.key;
+                const path = full[0 .. segments.len + 1];
+                switch (entry.value) {
+                    .string => |s| try self.setSegments(path, s),
+                    .list => |items| try self.setListSegments(path, items),
+                    .section => |nested| try self.applySectionValue(path, nested),
+                }
+            }
+            return;
+        }
+        try self.appendNewSectionEntries(segments, sec.entries);
+    }
+
+    /// Append a whole new section (or `[section "subsection"]`) at the end of
+    /// the document: one line per scalar entry, one line per item of a list
+    /// entry, all in ONE splice (so the block's own entries apply
+    /// atomically together, same as a single-key `appendNewSectionList`)
+    /// -- then, for each nested `.section` entry, a further new subsection
+    /// via a recursive `applySectionValue` call (already validated, so this
+    /// can only still fail on the same residual re-parse/allocation risk any
+    /// append can). Order among direct entries, and among nested sections,
+    /// matches `entries`.
+    fn appendNewSectionEntries(self: *Document, container: []const []const u8, entries: []const SectionEntry) DocumentError!void {
+        const leading = try self.newSectionHeaderLeading(container);
+        const indent = self.prevailingIndent();
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(self.arena, leading);
+        for (entries) |entry| {
+            switch (entry.value) {
+                .string => |s| {
+                    const rendered = try self.renderTyped([]const u8, s);
+                    const block = try self.buildEntryBlock("", indent, entry.key, &.{rendered});
+                    try text.appendSlice(self.arena, block.text);
+                },
+                .list => |items| {
+                    const rendered = try self.arena.alloc([]const u8, items.len);
+                    for (items, 0..) |it, i| rendered[i] = try self.renderTyped([]const u8, it);
+                    const block = try self.buildEntryBlock("", indent, entry.key, rendered);
+                    try text.appendSlice(self.arena, block.text);
+                },
+                .section => {},
+            }
+        }
+        try self.recordSpliceKind(self.source.len, self.source.len, text.items, true);
+
+        for (entries) |entry| {
+            if (entry.value != .section) continue;
+            var full: [3][]const u8 = undefined;
+            for (container, 0..) |seg, i| full[i] = seg;
+            full[container.len] = entry.key;
+            try self.applySectionValue(full[0 .. container.len + 1], entry.value.section);
+        }
+    }
+
     /// `setListSegments`'s create-missing-key path: parallels
     /// `setLiteralSegments`'s own create-then-cache handling, but against
     /// `created_lists` instead of `created` since a list create's splice
@@ -756,16 +914,115 @@ pub const Document = struct {
     /// `duplicate_keys` policy is `.accumulate`, a multi-value key may be
     /// backed by several lines, and the span map (which only ever holds the
     /// LAST occurrence -- see `locateAllOccurrences`) is not enough on its
-    /// own to find them all. Never creates.
+    /// own to find them all.
+    ///
+    /// When `segments` names no key line but resolves to an existing
+    /// SECTION or subsection instead (`segments.len` 1 or 2, and a `[section]`
+    /// or `[section "subsection"]` header exists for it), the whole section
+    /// is removed: EVERY physically distinct block matching it (under this
+    /// library's default `duplicate_sections = .merge` policy, a section may
+    /// legitimately reappear later in the file as its own separate header,
+    /// logically merged with the earlier one on read -- all of them go, not
+    /// just the first). Each block's own header line, every line between it
+    /// and the next header (its entries, any interspersed comments and blank
+    /// lines), and the blank-line separator that trailed it are removed --
+    /// everything up to (but not including) the next header line, or a
+    /// comment block immediately preceding that next header, which is left
+    /// with its neighbor rather than swept into this removal. A sibling
+    /// section/subsection, and any comment that is not immediately inside
+    /// one of this section's own blocks, is left byte-identical. A path
+    /// naming neither a key nor a section is `error.PathNotFound`; a
+    /// container segment that names an existing string/list value instead of
+    /// a section is `error.InvalidValue`, same as everywhere else a
+    /// container is resolved.
+    ///
+    /// Never creates.
     pub fn removeSegments(self: *Document, segments: []const []const u8) DocumentError!void {
         const occurrences = try self.locateAllOccurrences(segments);
-        if (occurrences.len == 0) return error.PathNotFound;
+        if (occurrences.len == 0) {
+            if (segments.len >= 1 and segments.len <= 2) {
+                if (try self.resolveContainer(segments)) |_| {
+                    const ranges = try self.sectionBlockRanges(segments);
+                    if (ranges.len > 0) {
+                        const ops = try self.arena.alloc(SpliceOp, ranges.len);
+                        for (ranges, 0..) |r, i| ops[i] = .{ .start = r.start, .end = r.end, .text = "" };
+                        try self.recordSpliceGroup(ops);
+                        const created_key = try self.joinSectionFolded(segments);
+                        _ = self.created.remove(created_key);
+                        _ = self.created_lists.remove(created_key);
+                        return;
+                    }
+                }
+            }
+            return error.PathNotFound;
+        }
         const ops = try self.arena.alloc(SpliceOp, occurrences.len);
         for (occurrences, 0..) |a, i| ops[i] = .{ .start = a.line_start, .end = a.line_end, .text = "" };
         try self.recordSpliceGroup(ops);
         const created_key = try self.joinSectionFolded(segments);
         _ = self.created.remove(created_key);
         _ = self.created_lists.remove(created_key);
+    }
+
+    /// Byte range of one physically distinct block, for `sectionBlockRanges`.
+    const BlockRange = struct { start: usize, end: usize };
+
+    /// Byte ranges of EVERY physically distinct section/subsection block
+    /// matching `container` (1 name, or 2 for a quoted subsection), in
+    /// source order -- ordinarily one, but under this library's default
+    /// `duplicate_sections = .merge` policy a section may reappear later in
+    /// the file as its own separate header that still resolves to the same
+    /// logical section on read, so every one of them must go. Each block
+    /// runs from its header line's start to the start of the NEXT header
+    /// line in the document (of any name), or to the start of a run of
+    /// comment lines immediately preceding that next header (so a comment
+    /// documenting the FOLLOWING section is left with it rather than swept
+    /// into this removal), or to end-of-source if it is the last section.
+    /// Empty if no header matches `container`. Only ever called after
+    /// `resolveContainer` has already confirmed `container` resolves to a
+    /// section, so an empty result in practice never happens under any of
+    /// this library's built-in dialects; `removeSegments` treats it as
+    /// `error.PathNotFound` rather than removing the wrong bytes.
+    fn sectionBlockRanges(self: *const Document, container: []const []const u8) Allocator.Error![]const BlockRange {
+        const d = self.options.dialect;
+        var tz = tok.Tokenizer.init(self.source, d);
+        var ranges: std.ArrayList(BlockRange) = .empty;
+        var open_start: ?usize = null;
+        var comment_run_start: ?usize = null;
+        while (tz.next()) |t| {
+            switch (t.kind) {
+                .section_header => {
+                    const hdr_start: usize = @intCast(t.span.start);
+                    if (open_start) |s| {
+                        const end = comment_run_start orelse hdr_start;
+                        try ranges.append(self.arena, .{ .start = s, .end = end });
+                        open_start = null;
+                    }
+                    comment_run_start = null;
+                    const raw = self.source[@intCast(t.span.start)..@intCast(t.span.end)];
+                    const parts = parser_mod.splitHeader(raw, d) catch continue;
+                    const name_matches = if (d.case_insensitive_sections)
+                        std.ascii.eqlIgnoreCase(parts.name, container[0])
+                    else
+                        std.mem.eql(u8, parts.name, container[0]);
+                    if (!name_matches) continue;
+                    if (container.len == 2) {
+                        const raw_sub = parts.subsection orelse continue;
+                        const sub = escape.unescapeSubsection(self.arena, raw_sub) catch continue;
+                        if (!std.mem.eql(u8, sub, container[1])) continue;
+                    } else if (parts.subsection != null) {
+                        continue;
+                    }
+                    open_start = hdr_start;
+                },
+                .comment => {
+                    if (comment_run_start == null) comment_run_start = @intCast(t.span.start);
+                },
+                else => comment_run_start = null,
+            }
+        }
+        if (open_start) |s| try ranges.append(self.arena, .{ .start = s, .end = self.source.len });
+        return ranges.items;
     }
 
     /// Insert a comment line immediately before the line containing `path`.
@@ -1261,17 +1518,28 @@ pub const Document = struct {
     /// adding a subsection to an existing `[section]` block. Shared by
     /// `insertSegments` (a single-value wrapper) and `insertListSegments`.
     fn appendNewSectionList(self: *Document, container: []const []const u8, key: []const u8, values: []const []const u8) DocumentError!ListInsertResult {
+        const leading = try self.newSectionHeaderLeading(container);
+        const indent = self.prevailingIndent();
+        const block = try self.buildEntryBlock(leading, indent, key, values);
+        try self.recordSpliceKind(self.source.len, self.source.len, block.text, true);
+        return .{ .leading = leading, .indent = indent, .key = key, .offsets = block.offsets };
+    }
+
+    /// The bytes to prepend before a brand-new section/subsection header line
+    /// so it starts its own paragraph at the end of the document: the
+    /// blank-line separator (`newSectionSeparator`) followed by the header
+    /// line itself (`[section]` or, for a 2-element `container`, `[section
+    /// "subsection"]`). Shared by `appendNewSectionList` (a single-key
+    /// block) and `appendNewSectionEntries` (a whole materialized section) --
+    /// the only two places a header line is ever created.
+    fn newSectionHeaderLeading(self: *Document, container: []const []const u8) Allocator.Error![]const u8 {
         const nl = dominantEol(self.source);
         const header = if (container.len == 2) blk: {
             const sub = try escapeSubsectionName(self.arena, container[1]);
             break :blk try std.fmt.allocPrint(self.arena, "[{s} \"{s}\"]{s}", .{ container[0], sub, nl });
         } else try std.fmt.allocPrint(self.arena, "[{s}]{s}", .{ container[0], nl });
         const sep = newSectionSeparator(self.source);
-        const indent = self.prevailingIndent();
-        const leading = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ sep, header });
-        const block = try self.buildEntryBlock(leading, indent, key, values);
-        try self.recordSpliceKind(self.source.len, self.source.len, block.text, true);
-        return .{ .leading = leading, .indent = indent, .key = key, .offsets = block.offsets };
+        return try std.fmt.allocPrint(self.arena, "{s}{s}", .{ sep, header });
     }
 
     /// Byte offset just past the source line of the first header matching
@@ -3173,7 +3441,10 @@ test "MULTIVAL: setValueSegments .string is byte-identical to setSegments" {
     try testing.expectEqualStrings(aw_b.written(), aw_a.written());
 }
 
-test "MULTIVAL: setValueSegments rejects a section value" {
+test "MULTIVAL: setValueSegments .section at a path shadowed by an existing scalar key is InvalidValue" {
+    // ["s", "k"] as a .section path means "subsection k of section s"
+    // (SECTION-01 below); here "k" already exists as a plain scalar key
+    // inside [s], so it cannot be turned into a subsection.
     const G = Dialect.gitconfig;
     const src = "[s]\n\tk = v\n";
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3516,4 +3787,311 @@ test "MULTIVAL: normal 2-segment and 3-segment multi-value collapse/remove are u
         const out = try emitAndReparse(a, &doc, .{ .dialect = G });
         try testing.expectEqualStrings("[s]\n\turl = u\n", out);
     }
+}
+
+test "SECTION: setValueSegments materializes a brand-new top-level section with two scalar entries" {
+    const G = Dialect.generic;
+    const src = "foo = bar\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "name", .value = .{ .string = "Ada" } },
+        .{ .key = "email", .value = .{ .string = "ada@example.com" } },
+    };
+    var sec = Section{ .entries = &entries };
+    try doc.setValueSegments(&.{"user"}, .{ .section = &sec });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("foo = bar\n\n[user]\nname = Ada\nemail = ada@example.com\n", out);
+    try testing.expectEqualStrings("Ada", doc.getSegments(&.{ "user", "name" }).?.string);
+    try testing.expectEqualStrings("ada@example.com", doc.getSegments(&.{ "user", "email" }).?.string);
+}
+
+test "SECTION: setValueSegments materializes a brand-new subsection under a quoting dialect" {
+    const G = Dialect.gitconfig;
+    const src = "[core]\n\tbare = false\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "url", .value = .{ .string = "git@example.com" } },
+    };
+    var sec = Section{ .entries = &entries };
+    try doc.setValueSegments(&.{ "remote", "origin" }, .{ .section = &sec });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(
+        "[core]\n\tbare = false\n\n[remote \"origin\"]\n\turl = git@example.com\n",
+        out,
+    );
+    try testing.expectEqualStrings("git@example.com", doc.getSegments(&.{ "remote", "origin", "url" }).?.string);
+}
+
+test "SECTION: setValueSegments materializes a section whose entry is a multi-value list" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "default", .value = .{ .list = &.{ "a", "b" } } },
+    };
+    var sec = Section{ .entries = &entries };
+    try doc.setValueSegments(&.{"push"}, .{ .section = &sec });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[a]\n\tx = 1\n\n[push]\n\tdefault = a\n\tdefault = b\n", out);
+    const list = doc.getSegments(&.{ "push", "default" }).?.list;
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqualStrings("a", list[0]);
+    try testing.expectEqualStrings("b", list[1]);
+}
+
+test "SECTION: setValueSegments into an already-existing section merges, no duplicate header" {
+    const G = Dialect.gitconfig;
+    const src = "[user]\n\tname = Ada\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "name", .value = .{ .string = "Grace" } },
+        .{ .key = "email", .value = .{ .string = "grace@example.com" } },
+    };
+    var sec = Section{ .entries = &entries };
+    try doc.setValueSegments(&.{"user"}, .{ .section = &sec });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[user]\n\tname = Grace\n\temail = grace@example.com\n", out);
+    // Exactly one [user] header: the merge did not append a second block.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "[user]"));
+}
+
+test "SECTION: setValueSegments merge is idempotent when re-applied" {
+    const G = Dialect.gitconfig;
+    const src = "[user]\n\tname = Ada\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "email", .value = .{ .string = "ada@example.com" } },
+    };
+    var sec = Section{ .entries = &entries };
+    try doc.setValueSegments(&.{"user"}, .{ .section = &sec });
+    const out1 = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try doc.setValueSegments(&.{"user"}, .{ .section = &sec });
+    const out2 = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(out1, out2);
+}
+
+test "SECTION: setValueSegments materializes a nested subsection entry alongside the parent's own keys" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var origin_entries = [_]value_mod.Entry{
+        .{ .key = "url", .value = .{ .string = "git@example.com" } },
+    };
+    var origin_sec = Section{ .entries = &origin_entries };
+    var remote_entries = [_]value_mod.Entry{
+        .{ .key = "note", .value = .{ .string = "top" } },
+        .{ .key = "origin", .value = .{ .section = &origin_sec } },
+    };
+    var remote_sec = Section{ .entries = &remote_entries };
+    try doc.setValueSegments(&.{"remote"}, .{ .section = &remote_sec });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings(
+        "[a]\n\tx = 1\n\n[remote]\n\tnote = top\n\n[remote \"origin\"]\n\turl = git@example.com\n",
+        out,
+    );
+    try testing.expectEqualStrings("top", doc.getSegments(&.{ "remote", "note" }).?.string);
+    try testing.expectEqualStrings("git@example.com", doc.getSegments(&.{ "remote", "origin", "url" }).?.string);
+}
+
+test "SECTION: setValueSegments rejects a subsection under a non-quoting dialect, leaving the document untouched" {
+    const G = Dialect.generic;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries: [0]value_mod.Entry = .{};
+    var sec = Section{ .entries = &entries };
+    try testing.expectError(error.PathNotFound, doc.setValueSegments(&.{ "b", "c" }, .{ .section = &sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments rejects an over-deep section path" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries: [0]value_mod.Entry = .{};
+    var sec = Section{ .entries = &entries };
+    try testing.expectError(error.PathNotFound, doc.setValueSegments(&.{ "b", "c", "d" }, .{ .section = &sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments rejects a nested section one level past what the dialect can express" {
+    // A subsection cannot itself hold a further nested section -- no
+    // dialect's header syntax expresses that depth.
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var too_deep_entries: [0]value_mod.Entry = .{};
+    var too_deep = Section{ .entries = &too_deep_entries };
+    var origin_entries = [_]value_mod.Entry{
+        .{ .key = "weird", .value = .{ .section = &too_deep } },
+    };
+    var origin_sec = Section{ .entries = &origin_entries };
+    var remote_entries = [_]value_mod.Entry{
+        .{ .key = "note", .value = .{ .string = "top" } },
+        .{ .key = "origin", .value = .{ .section = &origin_sec } },
+    };
+    var remote_sec = Section{ .entries = &remote_entries };
+    try testing.expectError(error.PathNotFound, doc.setValueSegments(&.{"remote"}, .{ .section = &remote_sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments validates the whole tree before any splice, even when an earlier entry is fine" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "good", .value = .{ .string = "ok" } },
+        .{ .key = "", .value = .{ .string = "bad" } },
+    };
+    var sec = Section{ .entries = &entries };
+    try testing.expectError(error.EmptyKey, doc.setValueSegments(&.{"remote"}, .{ .section = &sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments on a CRLF source stays CRLF throughout" {
+    const G = Dialect.gitconfig;
+    const src = "[core]\r\n\tbare = false\r\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "name", .value = .{ .string = "Ada" } },
+    };
+    var sec = Section{ .entries = &entries };
+    try doc.setValueSegments(&.{"user"}, .{ .section = &sec });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[core]\r\n\tbare = false\r\n\r\n[user]\r\n\tname = Ada\r\n", out);
+}
+
+test "SECTION: removeSegments deletes a whole section, byte-exact" {
+    const G = Dialect.generic;
+    const src = "foo = bar\n[user]\nname = Ada\nemail = ada@example.com\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{"user"});
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("foo = bar\n", out);
+}
+
+test "SECTION: removeSegments deletes one subsection, leaving a sibling subsection intact" {
+    const G = Dialect.gitconfig;
+    const src = "[remote \"origin\"]\n\turl = a\n\n[remote \"up\"]\n\turl = b\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{ "remote", "origin" });
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[remote \"up\"]\n\turl = b\n", out);
+    try testing.expect(doc.getSegments(&.{ "remote", "origin", "url" }) == null);
+    try testing.expectEqualStrings("b", doc.getSegments(&.{ "remote", "up", "url" }).?.string);
+}
+
+test "SECTION: removeSegments preserves a comment attached to the next section" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n\n[user]\n\tname = y\n\n# describes b\n[b]\n\tz = 2\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{"user"});
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[a]\n\tx = 1\n\n# describes b\n[b]\n\tz = 2\n", out);
+}
+
+test "SECTION: removeSegments deletes a comment interior to the removed section's own body" {
+    const G = Dialect.gitconfig;
+    const src = "[user]\n\t; a note\n\tname = y\n[b]\n\tz = 2\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{"user"});
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[b]\n\tz = 2\n", out);
+}
+
+test "SECTION: removeSegments on a section path is CRLF-preserving" {
+    const G = Dialect.gitconfig;
+    const src = "[core]\r\n\tbare = false\r\n\r\n[user]\r\n\tname = Ada\r\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{"user"});
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    // Every "\n" is part of a "\r\n" pair -- no bare LF crept in.
+    try testing.expectEqual(std.mem.count(u8, out, "\n"), std.mem.count(u8, out, "\r\n"));
+    try testing.expectEqualStrings("false", doc.getSegments(&.{ "core", "bare" }).?.string);
+    try testing.expect(doc.getSegments(&.{ "user", "name" }) == null);
+}
+
+test "SECTION: removeSegments on a name that is neither a key nor a section is PathNotFound" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try testing.expectError(error.PathNotFound, doc.removeSegments(&.{"nope"}));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: removeSegments through a scalar container is InvalidValue, not a silent no-op" {
+    // "a" is a root-level SCALAR key (no section header at all), so no
+    // key line anywhere has current_path == "a" for `locateAllOccurrences`
+    // to find under ["a", "b"] -- the path only fails once it is resolved as
+    // a SECTION container, where "a" cannot be descended into.
+    const G = Dialect.generic;
+    const src = "a = 1\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try testing.expectError(error.InvalidValue, doc.removeSegments(&.{ "a", "b" }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
 }

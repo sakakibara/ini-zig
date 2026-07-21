@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Document.setValueSegments`: a `.section` value now materializes a whole
+  section (`segments.len == 1`) or, under a subsection-quoting dialect, a
+  whole subsection (`segments.len == 2`) instead of `error.InvalidValue`.
+  Every entry is written under it, in order -- a nested `.string`, `.list`,
+  or further `.section` entry each handled exactly as it would be at that
+  path directly, so a nested subsection materializes as its own further
+  `[section "subsection"]` header. If the target already exists, its entries
+  are merged into it (no duplicate header); otherwise a whole new section (or
+  subsection) is appended at the end of the document, separated the same way
+  a single created key's section already was.
+- `Document.removeSegments`: when `segments` names no key line but resolves
+  to an existing section or subsection instead, the whole section is removed
+  -- every physically distinct block matching it (a section may legitimately
+  reappear later in the file as its own separate header under this library's
+  default `duplicate_sections = .merge` policy), its entries, and its
+  blank-line separator, while a sibling section/subsection and a comment
+  documenting a NEIGHBORING section are left untouched.
+
 ## [0.4.0] - 2026-07-22
 
 ### Added
