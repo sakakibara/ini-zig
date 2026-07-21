@@ -786,6 +786,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
     try checkListValue(a, dialect, dialect_name, gen, path, rng, idx, seed);
     try checkCrossKindReset(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
     try checkScalarCollapseOfList(a, dialect, dialect_name, gen, rng, idx, seed);
+    try checkSectionValue(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
 }
 
 /// Case-flip the section (index 0) and leaf key (the last index) of `path`,
@@ -1328,6 +1329,243 @@ fn checkScalarCollapseOfList(
         if (!std.mem.eql(u8, out_after, gen.source)) {
             report(dialect_name, idx, seed, gen.source, path, value, out_after, "scalar-collapse: failed edit did not roll back");
             return error.ScalarCollapseNotRolledBack;
+        }
+    }
+}
+
+/// True when `path` is `container` itself, or nested under it -- used to
+/// exempt a merge target's OWN entries from the sibling-preservation checks
+/// below (a merge is allowed to add or overwrite keys there).
+fn underContainer(path: []const []const u8, container: []const []const u8) bool {
+    return path.len > container.len and segsEqual(path[0..container.len], container);
+}
+
+/// `setValueSegments`'s `.section` branch, against its own fresh `Document`:
+/// materializes a small (1-2 entry) section value at either an EXISTING
+/// model container (exercising the MERGE path) or a fresh container
+/// (exercising CREATE), covering a scalar entry and, under an accumulate
+/// dialect, a multi-value list entry. Nested `.section` entries are not
+/// generated here -- the hand-written suite in document.zig covers those
+/// directly; this focuses on the flat create/merge shape a generator can
+/// build easily.
+///
+/// Checks total-or-clean, reparse-clean, per-entry read-back, sibling
+/// preservation (scalar and multi-value, exempting the container's own
+/// entries), comments survive, and a remove round-trip -- the same
+/// invariants `checkListValue` checks. Idempotence is checked ACROSS a
+/// fresh reparse rather than within the same in-memory `Document`: a
+/// same-session re-`setValueSegments` on a freshly CREATED section
+/// duplicates its header (the same limitation the plain single-key create
+/// path already has for two different new keys under one new section --
+/// see `Document.setValueSegments`'s doc comment), so same-session
+/// idempotence does not hold for a CREATE and is not asserted here.
+fn checkSectionValue(
+    a: std.mem.Allocator,
+    dialect: Dialect,
+    dialect_name: []const u8,
+    gen: GenResult,
+    rng: std.Random,
+    ctr: *usize,
+    idx: usize,
+    seed: u64,
+) !void {
+    var containers: std.ArrayList([]const []const u8) = .empty;
+    for (gen.model) |e| if (e.len >= 2) try containers.append(a, e.segs[0 .. e.len - 1]);
+    const container = if (containers.items.len > 0 and rng.uintLessThan(u8, 100) < 40)
+        containers.items[rng.uintLessThan(usize, containers.items.len)]
+    else blk: {
+        const depth: usize = if (dialect.subsections == .quoted and rng.boolean()) 2 else 1;
+        const segs = try a.alloc([]const u8, depth);
+        for (segs) |*s| s.* = try candidateName(a, rng, ctr);
+        break :blk segs;
+    };
+
+    const n = rng.intRangeAtMost(usize, 1, 2);
+    const entries = try a.alloc(ini.value.Entry, n);
+    var desc: std.ArrayList(u8) = .empty;
+    for (entries, 0..) |*e, i| {
+        ctr.* += 1;
+        const key = try std.fmt.allocPrint(a, "sv{d}", .{ctr.*});
+        if (dialect.duplicate_keys == .accumulate and rng.boolean()) {
+            const items = try a.alloc([]const u8, rng.intRangeAtMost(usize, 2, 3));
+            for (items) |*v| v.* = genTargetValue(rng);
+            e.* = .{ .key = key, .value = .{ .list = items } };
+        } else {
+            e.* = .{ .key = key, .value = .{ .string = genTargetValue(rng) } };
+        }
+        if (i > 0) try desc.append(a, ',');
+        try desc.appendSlice(a, key);
+    }
+    var sec = ini.Section{ .entries = entries };
+    const desc_str = desc.items;
+
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, container, desc_str, null, "section: source failed to parse");
+        return err;
+    };
+
+    if (doc.setValueSegments(container, .{ .section = &sec })) |_| {
+        const out1 = try emitToOwned(a, &doc);
+        try assertCrlfPreserved(dialect_name, idx, seed, gen, container, desc_str, out1, "CRLF source gained a bare LF (section set)");
+
+        const reparsed = ini.parse(a, out1, .{ .dialect = dialect }) catch |e| {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: output failed to reparse");
+            return e;
+        };
+
+        // Invariant 3: read-back exact, per entry.
+        for (entries) |e| {
+            var path_buf: [3][]const u8 = undefined;
+            for (container, 0..) |s, i| path_buf[i] = s;
+            path_buf[container.len] = e.key;
+            const path = path_buf[0 .. container.len + 1];
+            const got = reparsed.getSegments(path) orelse {
+                report(dialect_name, idx, seed, gen.source, path, desc_str, out1, "section: entry read-back missing");
+                return error.SectionEntryMissing;
+            };
+            switch (e.value) {
+                .string => |s| {
+                    if (got != .string or !std.mem.eql(u8, got.string, s)) {
+                        report(dialect_name, idx, seed, gen.source, path, desc_str, out1, "section: entry read-back mismatch");
+                        return error.SectionEntryMismatch;
+                    }
+                },
+                .list => |items| {
+                    if (got != .list or got.list.len != items.len) {
+                        report(dialect_name, idx, seed, gen.source, path, desc_str, out1, "section: list entry read-back mismatch");
+                        return error.SectionEntryMismatch;
+                    }
+                    for (got.list, items) |g, w| {
+                        if (!std.mem.eql(u8, g, w)) {
+                            report(dialect_name, idx, seed, gen.source, path, desc_str, out1, "section: list entry item mismatch");
+                            return error.SectionEntryMismatch;
+                        }
+                    }
+                },
+                .section => unreachable,
+            }
+        }
+
+        // Invariant 4: every other model/list_model entry survives untouched.
+        for (gen.model) |e| {
+            if (underContainer(e.segs[0..e.len], container)) continue;
+            const gv = reparsed.getSegments(e.segs[0..e.len]) orelse {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: sibling dropped");
+                return error.SectionSiblingDropped;
+            };
+            if (gv != .string or !std.mem.eql(u8, gv.string, e.value)) {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: sibling corrupted");
+                return error.SectionSiblingCorrupted;
+            }
+        }
+        for (gen.list_model) |e| {
+            if (underContainer(e.segs[0..e.len], container)) continue;
+            const gv = reparsed.getSegments(e.segs[0..e.len]) orelse {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: list sibling dropped");
+                return error.SectionSiblingDropped;
+            };
+            if (gv != .list or gv.list.len != e.items.len) {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: list sibling corrupted");
+                return error.SectionSiblingCorrupted;
+            }
+            for (gv.list, e.items) |g, w| {
+                if (!std.mem.eql(u8, g, w)) {
+                    report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: list sibling item corrupted");
+                    return error.SectionSiblingCorrupted;
+                }
+            }
+        }
+
+        // Invariant 5: every comment survives, as a whole line.
+        try assertCommentsSurvive(a, dialect_name, idx, seed, gen, container, desc_str, out1, "section: comment dropped");
+
+        // Invariant 6 (cross-reparse idempotence -- see the doc comment above).
+        var doc2 = ini.Document.parse(a, out1, .{ .dialect = dialect }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: first output failed to reparse for idempotence");
+            return err;
+        };
+        doc2.setValueSegments(container, .{ .section = &sec }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: idempotent re-apply (fresh reparse) errored");
+            return err;
+        };
+        const out2 = try emitToOwned(a, &doc2);
+        if (!std.mem.eql(u8, out1, out2)) {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: not idempotent across a fresh reparse");
+            return error.SectionNotIdempotent;
+        }
+
+        // Invariant 7: remove round-trip.
+        var doc3 = ini.Document.parse(a, out1, .{ .dialect = dialect }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: output failed to reparse for remove");
+            return err;
+        };
+        doc3.removeSegments(container) catch |err| {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out1, "section: remove errored on an existing section");
+            return err;
+        };
+        const outc = try emitToOwned(a, &doc3);
+        try assertCrlfPreserved(dialect_name, idx, seed, gen, container, desc_str, outc, "CRLF source gained a bare LF (section remove)");
+        const reparsedC = ini.parse(a, outc, .{ .dialect = dialect }) catch |err| {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, outc, "section: post-remove output failed to reparse");
+            return err;
+        };
+        // A 1-segment container may still resolve as a Value after removal
+        // (a bare `[section]` removal never cascades into a `[section
+        // "sub"]` nested under the same name -- see the doc comment on
+        // `Document.removeSegments`), so the precise check is per ENTRY we
+        // just set, not the container path as a whole.
+        for (entries) |e| {
+            var path_buf: [3][]const u8 = undefined;
+            for (container, 0..) |s, i| path_buf[i] = s;
+            path_buf[container.len] = e.key;
+            const path = path_buf[0 .. container.len + 1];
+            if (reparsedC.getSegments(path) != null) {
+                report(dialect_name, idx, seed, gen.source, path, desc_str, outc, "section: entry still present after remove");
+                return error.SectionRemoveIneffective;
+            }
+        }
+        for (gen.model) |e| {
+            if (underContainer(e.segs[0..e.len], container)) continue;
+            const gv = reparsedC.getSegments(e.segs[0..e.len]) orelse {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, outc, "section: remove sibling dropped");
+                return error.SectionSiblingDropped;
+            };
+            if (gv != .string or !std.mem.eql(u8, gv.string, e.value)) {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, outc, "section: remove sibling corrupted");
+                return error.SectionSiblingCorrupted;
+            }
+        }
+        for (gen.list_model) |e| {
+            if (underContainer(e.segs[0..e.len], container)) continue;
+            const gv = reparsedC.getSegments(e.segs[0..e.len]) orelse {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, outc, "section: remove list sibling dropped");
+                return error.SectionSiblingDropped;
+            };
+            if (gv != .list or gv.list.len != e.items.len) {
+                report(dialect_name, idx, seed, gen.source, container, desc_str, outc, "section: remove list sibling corrupted");
+                return error.SectionSiblingCorrupted;
+            }
+            for (gv.list, e.items) |g, w| {
+                if (!std.mem.eql(u8, g, w)) {
+                    report(dialect_name, idx, seed, gen.source, container, desc_str, outc, "section: remove list sibling item corrupted");
+                    return error.SectionSiblingCorrupted;
+                }
+            }
+        }
+        // No blanket assertCommentsSurvive here (unlike the set/merge branch
+        // above): a whole-section remove legitimately deletes any comment
+        // that was physically INSIDE the removed block(s), and `gen.comments`
+        // (a flat text list, not tied to the path that owns each comment)
+        // cannot tell an interior comment apart from one outside it. The
+        // hand-written suite in document.zig covers both directions
+        // (interior comments removed, a neighbor's comment preserved)
+        // directly.
+    } else |_| {
+        // Invariant 1: set is total-or-clean.
+        const out_after = try emitToOwned(a, &doc);
+        if (!std.mem.eql(u8, out_after, gen.source)) {
+            report(dialect_name, idx, seed, gen.source, container, desc_str, out_after, "section: failed edit did not roll back");
+            return error.SectionNotRolledBack;
         }
     }
 }
