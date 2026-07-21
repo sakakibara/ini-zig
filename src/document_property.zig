@@ -32,6 +32,8 @@ const GenResult = struct {
     source: []const u8,
     model: []ModelEntry,
     comments: [][]const u8,
+    /// Whether `source` uses `\r\n` line endings throughout (see `toCrlf`).
+    crlf: bool,
 };
 
 const safe_pool = [_][]const u8{ "abc", "k1", "foo", "alpha", "beta", "sec", "item" };
@@ -255,11 +257,37 @@ fn extractComments(a: std.mem.Allocator, source: []const u8, dialect: Dialect) !
     return out.toOwnedSlice(a);
 }
 
+/// Rewrite `source` (built with bare `\n` line endings, the only kind
+/// `Document.empty`-backed construction ever produces) to `\r\n` throughout,
+/// so the generator can also exercise a CRLF source -- the current battery
+/// only ever built from `Document.empty`, so it never caught a mutation that
+/// forced every appended line to bare `\n` regardless of the source's own
+/// line ending.
+fn toCrlf(a: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (source) |c| {
+        if (c == '\n') try out.append(a, '\r');
+        try out.append(a, c);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// True when `s` contains a `\n` not immediately preceded by `\r`: a source
+/// that started fully CRLF (see `toCrlf`) must never gain one of these, since
+/// every append path mirrors `dominantEol`/`leadingNewlineIfNeeded` off the
+/// source's own line ending.
+fn hasBareLf(s: []const u8) bool {
+    for (s, 0..) |c, i| {
+        if (c == '\n' and (i == 0 or s[i - 1] != '\r')) return true;
+    }
+    return false;
+}
+
 /// Generate a random valid document for `dialect`: 1-3 top-level sections,
 /// each promoted (re-parsed) before the next is built so a later section's
 /// creation sees genuine prior content (a real blank-line separator,
 /// exercising layout preservation), then 0-3 comments inserted against
-/// existing dot-free paths.
+/// existing dot-free paths, then (with even odds) rewritten to CRLF.
 fn genDoc(a: std.mem.Allocator, dialect: Dialect, rng: std.Random, ctr: *usize) !GenResult {
     var builder = try ini.Document.empty(a, .{ .dialect = dialect });
     var model: std.ArrayList(ModelEntry) = .empty;
@@ -283,12 +311,15 @@ fn genDoc(a: std.mem.Allocator, dialect: Dialect, rng: std.Random, ctr: *usize) 
         builder.addCommentBefore(dotted, text) catch continue;
     }
 
-    const source = try emitToOwned(a, &builder);
+    const lf_source = try emitToOwned(a, &builder);
     // Sanity check on the generator itself: a constructed document must
     // always be valid INI for its dialect.
-    _ = try ini.parse(a, source, .{ .dialect = dialect });
+    _ = try ini.parse(a, lf_source, .{ .dialect = dialect });
+    const crlf = rng.boolean();
+    const source = if (crlf) try toCrlf(a, lf_source) else lf_source;
+    if (crlf) _ = try ini.parse(a, source, .{ .dialect = dialect });
     const comments = try extractComments(a, source, dialect);
-    return .{ .source = source, .model = try model.toOwnedSlice(a), .comments = comments };
+    return .{ .source = source, .model = try model.toOwnedSlice(a), .comments = comments, .crlf = crlf };
 }
 
 fn modelFind(model: []const ModelEntry, path: []const []const u8) ?[]const u8 {
@@ -348,6 +379,69 @@ fn genPath(a: std.mem.Allocator, rng: std.Random, model: []const ModelEntry, dia
     return genFreshPath(a, dialect, rng, ctr);
 }
 
+/// Every line of `s`, trimmed the same way `extractComments` trims a
+/// comment line, so a whole-line comparison against `extractComments`'
+/// output is exact.
+fn lineMultiset(a: std.mem.Allocator, s: []const u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, s, '\n');
+    while (lines.next()) |line| try out.append(a, std.mem.trim(u8, line, " \t\r"));
+    return out.toOwnedSlice(a);
+}
+
+fn countOccurrences(lines: []const []const u8, target: []const u8) usize {
+    var n: usize = 0;
+    for (lines) |l| {
+        if (std.mem.eql(u8, l, target)) n += 1;
+    }
+    return n;
+}
+
+/// Every comment in `comments` survives in `out` as a WHOLE LINE, checked by
+/// multiset count rather than `std.mem.indexOf` substring search -- a
+/// substring check would let `# note 1` be satisfied by the mere presence of
+/// `# note 10`, or by a coincidentally colliding key/value line.
+fn assertCommentsSurvive(
+    a: std.mem.Allocator,
+    dialect_name: []const u8,
+    idx: usize,
+    seed: u64,
+    gen: GenResult,
+    path: []const []const u8,
+    value: []const u8,
+    out: []const u8,
+    what: []const u8,
+) !void {
+    const out_lines = try lineMultiset(a, out);
+    for (gen.comments) |c| {
+        const want = countOccurrences(gen.comments, c);
+        const have = countOccurrences(out_lines, c);
+        if (have < want) {
+            report(dialect_name, idx, seed, gen.source, path, value, out, what);
+            return error.CommentDropped;
+        }
+    }
+}
+
+/// A CRLF source (see `GenResult.crlf`) must stay fully CRLF: no edit path
+/// may introduce a bare `\n`.
+fn assertCrlfPreserved(
+    dialect_name: []const u8,
+    idx: usize,
+    seed: u64,
+    gen: GenResult,
+    path: []const []const u8,
+    value: []const u8,
+    out: []const u8,
+    what: []const u8,
+) !void {
+    if (!gen.crlf) return;
+    if (hasBareLf(out)) {
+        report(dialect_name, idx, seed, gen.source, path, value, out, what);
+        return error.CrlfNotPreserved;
+    }
+}
+
 fn report(
     dialect_name: []const u8,
     idx: usize,
@@ -379,6 +473,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
 
     if (docA.setSegments(path, value)) |_| {
         const out1 = try emitToOwned(a, &docA);
+        try assertCrlfPreserved(dialect_name, idx, seed, gen, path, value, out1, "CRLF source gained a bare LF (set)");
 
         // Invariant 2: reparse-clean.
         const reparsed = ini.parse(a, out1, .{ .dialect = dialect }) catch |e| {
@@ -409,13 +504,8 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
             }
         }
 
-        // Invariant 5: every comment survives.
-        for (gen.comments) |c| {
-            if (std.mem.indexOf(u8, out1, c) == null) {
-                report(dialect_name, idx, seed, gen.source, path, value, out1, "comment dropped");
-                return error.CommentDropped;
-            }
-        }
+        // Invariant 5: every comment survives, as a whole line.
+        try assertCommentsSurvive(a, dialect_name, idx, seed, gen, path, value, out1, "comment dropped");
         // Invariant 5b: a pure value-replace on a fold-invariant path is a
         // byte-exact diff over just the old value's span.
         if (existed_before and allSafeNames(path)) {
@@ -461,6 +551,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
                 return e;
             };
             const outc = try emitToOwned(a, &docC);
+            try assertCrlfPreserved(dialect_name, idx, seed, gen, path, value, outc, "CRLF source gained a bare LF (remove)");
             const reparsedC = ini.parse(a, outc, .{ .dialect = dialect }) catch |e| {
                 report(dialect_name, idx, seed, gen.source, path, value, outc, "post-remove output failed to reparse");
                 return e;
@@ -480,12 +571,7 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
                     return error.RemoveSiblingCorrupted;
                 }
             }
-            for (gen.comments) |c| {
-                if (std.mem.indexOf(u8, outc, c) == null) {
-                    report(dialect_name, idx, seed, gen.source, path, value, outc, "remove: comment dropped");
-                    return error.RemoveCommentDropped;
-                }
-            }
+            try assertCommentsSurvive(a, dialect_name, idx, seed, gen, path, value, outc, "remove: comment dropped");
         }
     } else |_| {
         // Invariant 1: set is total-or-clean -- an error must leave the
@@ -495,6 +581,164 @@ fn runCase(a: std.mem.Allocator, dialect: Dialect, dialect_name: []const u8, rng
             report(dialect_name, idx, seed, gen.source, path, value, out_after, "failed edit did not roll back");
             return error.NotRolledBack;
         }
+    }
+
+    try checkCaseVariant(a, dialect, dialect_name, gen, rng, idx, seed);
+    try checkResetToDistinctValue(a, dialect, dialect_name, gen, rng, &ctr, idx, seed);
+}
+
+/// Case-flip the section (index 0) and leaf key (the last index) of `path`,
+/// leaving a subsection (index 1 of a 3-segment path) untouched -- mirrors
+/// exactly which segments `Document`'s case-folding covers (`foldedSection`
+/// only ever folds index 0, `foldedKey` only ever folds the leaf).
+fn caseFlip(a: std.mem.Allocator, path: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, path.len);
+    for (path, 0..) |seg, i| {
+        if (i == 0 or i == path.len - 1) {
+            const up = try a.alloc(u8, seg.len);
+            for (seg, 0..) |c, j| up[j] = std.ascii.toUpper(c);
+            out[i] = up;
+        } else {
+            out[i] = seg;
+        }
+    }
+    return out;
+}
+
+/// Pick an existing model entry built from pure lowercase-safe names (so its
+/// uppercase variant is unambiguous -- see `isSafeName`), set its case-flipped
+/// path to a fresh value, and check the two BUG2 directions: under a dialect
+/// that folds both sections and keys, the set must resolve INTO the existing
+/// entry (no new line, scalar read-back at the canonical path); under a
+/// dialect that folds neither, it must create a genuinely distinct entry
+/// (the original entry untouched, the variant path reads back its own value).
+fn checkCaseVariant(
+    a: std.mem.Allocator,
+    dialect: Dialect,
+    dialect_name: []const u8,
+    gen: GenResult,
+    rng: std.Random,
+    idx: usize,
+    seed: u64,
+) !void {
+    var candidates: std.ArrayList(usize) = .empty;
+    for (gen.model, 0..) |e, i| {
+        if (e.len < 2 or e.len > max_segments) continue;
+        if (allSafeNames(e.segs[0..e.len])) try candidates.append(a, i);
+    }
+    if (candidates.items.len == 0) return;
+    const e = gen.model[candidates.items[rng.uintLessThan(usize, candidates.items.len)]];
+    const canonical = e.segs[0..e.len];
+    const variant = try caseFlip(a, canonical);
+    const new_value: []const u8 = "CASEVARIANT";
+
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, variant, new_value, null, "case-variant: source failed to parse");
+        return err;
+    };
+    const before_lines = std.mem.count(u8, gen.source, "\n");
+    doc.setSegments(variant, new_value) catch |err| {
+        report(dialect_name, idx, seed, gen.source, variant, new_value, null, "case-variant: set errored");
+        return err;
+    };
+    const out = try emitToOwned(a, &doc);
+    try assertCrlfPreserved(dialect_name, idx, seed, gen, variant, new_value, out, "CRLF source gained a bare LF (case-variant)");
+    const after_lines = std.mem.count(u8, out, "\n");
+    const reparsed = ini.parse(a, out, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: output failed to reparse");
+        return err;
+    };
+
+    const folds = dialect.case_insensitive_sections and dialect.case_insensitive_keys;
+    if (folds) {
+        if (after_lines != before_lines) {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: resolving into an existing key added a line");
+            return error.CaseVariantDuplicated;
+        }
+        const got = reparsed.getSegments(canonical) orelse {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: canonical path missing after fold-in");
+            return error.CaseVariantMissing;
+        };
+        if (got != .string or !std.mem.eql(u8, got.string, new_value)) {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: did not resolve into the existing key as a scalar");
+            return error.CaseVariantNotScalar;
+        }
+    } else {
+        // No line-count assertion here: a distinct new entry may cost one
+        // line (append into an existing section) or several (a whole new
+        // section, plus its blank-line separator) depending on where the
+        // canonical path's section happens to sit. The two read-back checks
+        // below already pin down "genuinely distinct, not folded in": if a
+        // case-sensitive dialect ever wrongly folded, the ORIGINAL entry
+        // would read back as `new_value` instead of `e.value`, tripping the
+        // very next check.
+        const orig = reparsed.getSegments(canonical) orelse {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: original entry lost under case-sensitive dialect");
+            return error.CaseVariantOriginalLost;
+        };
+        if (orig != .string or !std.mem.eql(u8, orig.string, e.value)) {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: original entry mutated under case-sensitive dialect");
+            return error.CaseVariantOriginalMutated;
+        }
+        const got = reparsed.getSegments(variant) orelse {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: new distinct entry missing under case-sensitive dialect");
+            return error.CaseVariantMissing;
+        };
+        if (got != .string or !std.mem.eql(u8, got.string, new_value)) {
+            report(dialect_name, idx, seed, gen.source, variant, new_value, out, "case-variant: new distinct entry has wrong value");
+            return error.CaseVariantWrongValue;
+        }
+    }
+}
+
+/// Set a fresh path to one value, then re-set the SAME path to a DIFFERENT
+/// value: the second set must overwrite in place (exactly one line added
+/// total, scalar read-back of the second value), not append a second line
+/// for the same path (BUG1).
+fn checkResetToDistinctValue(
+    a: std.mem.Allocator,
+    dialect: Dialect,
+    dialect_name: []const u8,
+    gen: GenResult,
+    rng: std.Random,
+    ctr: *usize,
+    idx: usize,
+    seed: u64,
+) !void {
+    const path = try genFreshPath(a, dialect, rng, ctr);
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, path, "", null, "reset-distinct: source failed to parse");
+        return err;
+    };
+    doc.setSegments(path, @as([]const u8, "first")) catch return;
+    const out1 = try emitToOwned(a, &doc);
+    // Whatever the first create cost (one line for a key append, several for
+    // a whole new section plus its blank-line separator) is the baseline; the
+    // SECOND set, to a different value, must not add anything more.
+    const lines_after_first = std.mem.count(u8, out1, "\n");
+
+    doc.setSegments(path, @as([]const u8, "second")) catch |err| {
+        report(dialect_name, idx, seed, gen.source, path, "second", null, "reset-distinct: second set on a freshly created path errored");
+        return err;
+    };
+    const out = try emitToOwned(a, &doc);
+    try assertCrlfPreserved(dialect_name, idx, seed, gen, path, "second", out, "CRLF source gained a bare LF (reset-distinct)");
+    const after_lines = std.mem.count(u8, out, "\n");
+    if (after_lines != lines_after_first) {
+        report(dialect_name, idx, seed, gen.source, path, "second", out, "reset-distinct: a different value on a freshly created path added a second line");
+        return error.ResetToDistinctValueDuplicated;
+    }
+    const reparsed = ini.parse(a, out, .{ .dialect = dialect }) catch |err| {
+        report(dialect_name, idx, seed, gen.source, path, "second", out, "reset-distinct: output failed to reparse");
+        return err;
+    };
+    const got = reparsed.getSegments(path) orelse {
+        report(dialect_name, idx, seed, gen.source, path, "second", out, "reset-distinct: path missing after re-set");
+        return error.ResetToDistinctValueMissing;
+    };
+    if (got != .string or !std.mem.eql(u8, got.string, "second")) {
+        report(dialect_name, idx, seed, gen.source, path, "second", out, "reset-distinct: read-back is not the second value");
+        return error.ResetToDistinctValueMismatch;
     }
 }
 
@@ -520,4 +764,12 @@ test "document property battery: generic" {
 
 test "document property battery: gitconfig" {
     try runBattery(Dialect.gitconfig, "gitconfig", 0x2202_3333_cbcb_ebeb, 1500);
+}
+
+// generic and gitconfig both fold sections AND keys, so neither ever
+// exercises the case-SENSITIVE direction of `checkCaseVariant` (a
+// case-variant path must stay distinct, not resolve in). strict folds
+// neither, covering that direction.
+test "document property battery: strict" {
+    try runBattery(Dialect.strict, "strict", 0x3303_4444_dcdc_fcfc, 1500);
 }
