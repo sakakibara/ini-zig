@@ -97,6 +97,24 @@ const Anchors = struct {
     key_end: usize,
 };
 
+/// Value token's byte range within a just-created line's spliced `text` (NOT
+/// `source` offsets -- the whole line is freshly injected text, not a range
+/// into the original buffer). Returned by the insert* helpers so a create can
+/// be recorded precisely enough to overwrite just its value substring later,
+/// on a re-`set` to a different value -- see `Document.created`.
+const ValueOffset = struct { start: usize, end: usize };
+
+/// Bookkeeping for one path created by an edit in this session -- see
+/// `Document.created`.
+const CreatedEntry = struct {
+    /// `Splice.seq` of the zero-width insertion that wrote this line.
+    seq: u32,
+    /// The value token's current byte range within that splice's `text`.
+    value: ValueOffset,
+    /// Raw bytes last used to create/update this path.
+    raw: []const u8,
+};
+
 pub const Document = struct {
     arena: Allocator,
     /// Source bytes with any leading BOM stripped. Spans index into this slice.
@@ -116,15 +134,20 @@ pub const Document = struct {
     splices: std.ArrayList(Splice),
     /// Monotonic counter assigning each splice its call-order tiebreaker.
     seq: u32,
-    /// Path (folded the same way `joinSectionFolded` keys `spans`) -> raw
-    /// bytes last used to CREATE it, for every path created by an edit in
-    /// this session. `parsed`/`spans` stay pinned to the original source, so
-    /// a path an edit created is invisible to `locateSegments` forever after
+    /// Path (folded the same way `joinSectionFolded` keys `spans`) -> the
+    /// create edit that wrote it, for every path created by an edit in this
+    /// session. `parsed`/`spans` stay pinned to the original source, so a
+    /// path an edit created is invisible to `locateSegments` forever after
     /// (it never gains a span); without this cache, repeating the exact same
     /// create-`set` would not recognize its own prior create and would
     /// append a second, duplicate entry instead of being the no-op every
-    /// other repeated `set` already is. Cleared for a path on `removeSegments`.
-    created: std.StringHashMapUnmanaged([]const u8),
+    /// other repeated `set` already is. Genuinely load-bearing beyond that
+    /// dedup: a later `set` to the SAME path with a DIFFERENT value looks up
+    /// the original splice by `CreatedEntry.seq` and overwrites its value
+    /// substring in place (see `overwriteCreatedValue`), so re-setting a
+    /// freshly created path to a new value never appends a second line.
+    /// Cleared for a path on `removeSegments`.
+    created: std.StringHashMapUnmanaged(CreatedEntry),
 
     pub fn parse(arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) DocumentError!Document {
         const has_bom = std.mem.startsWith(u8, src, "\xEF\xBB\xBF");
@@ -278,13 +301,16 @@ pub const Document = struct {
         }
         // A path an earlier create in this session already added is
         // permanently invisible to `locateSegments` (see `created`'s doc
-        // comment), so an exact repeat of that same create is recognized
-        // here instead: a byte-identical no-op, matching how a repeat set on
-        // an originally-existing path is already a no-op via the exact-range
-        // overwrite in recordSplice.
+        // comment), so it is resolved here instead: a byte-identical repeat
+        // is a no-op (matching how a repeat set on an originally-existing
+        // path is already a no-op via the exact-range overwrite in
+        // recordSplice), and a repeat with a DIFFERENT value overwrites the
+        // prior create's value substring in place rather than falling
+        // through to `insertSegments`, which would append a second line.
         const created_key = try self.joinSectionFolded(segments);
-        if (self.created.get(created_key)) |prev_raw| {
-            if (std.mem.eql(u8, prev_raw, raw)) return;
+        if (self.created.get(created_key)) |entry| {
+            if (std.mem.eql(u8, entry.raw, raw)) return;
+            return self.overwriteCreatedValue(created_key, entry, raw);
         }
         // Prepare every fallible step before the mutating insert, so a
         // failure here can never leave a splice recorded with no matching
@@ -292,8 +318,41 @@ pub const Document = struct {
         // otherwise guarantees).
         const owned_raw = try self.arena.dupe(u8, raw);
         try self.created.ensureUnusedCapacity(self.arena, 1);
-        try self.insertSegments(segments, raw);
-        self.created.putAssumeCapacity(created_key, owned_raw);
+        const seq_before = self.seq;
+        const value = try self.insertSegments(segments, raw);
+        self.created.putAssumeCapacity(created_key, .{ .seq = seq_before, .value = value, .raw = owned_raw });
+    }
+
+    /// Overwrite the value substring of a path created earlier this session
+    /// (found by the `Splice.seq` `created` recorded for it) with `raw`,
+    /// instead of appending a whole new line the way `insertSegments` would.
+    /// The zero-width create-splice's `text` is edited directly (bypassing
+    /// `recordSplice`'s own dedup, which only recognizes an exact-range or a
+    /// byte-identical repeat, neither of which this is) with the same
+    /// rollback-on-reparse-failure discipline `recordSplice` uses elsewhere.
+    fn overwriteCreatedValue(
+        self: *Document,
+        created_key: []const u8,
+        entry: CreatedEntry,
+        raw: []const u8,
+    ) DocumentError!void {
+        const owned_raw = try self.arena.dupe(u8, raw);
+        var idx: usize = 0;
+        while (self.splices.items[idx].seq != entry.seq) idx += 1;
+        const old_text = self.splices.items[idx].text;
+        const new_text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{
+            old_text[0..entry.value.start], raw, old_text[entry.value.end..],
+        });
+        self.splices.items[idx].text = new_text;
+        self.refreshView() catch |e| {
+            self.splices.items[idx].text = old_text;
+            return e;
+        };
+        self.created.putAssumeCapacity(created_key, .{
+            .seq = entry.seq,
+            .value = .{ .start = entry.value.start, .end = entry.value.start + raw.len },
+            .raw = owned_raw,
+        });
     }
 
     /// Delete the whole line containing `path`. Never creates.
@@ -370,18 +429,26 @@ pub const Document = struct {
         return self.anchorsForSpan(span);
     }
 
-    /// Join `segments` into the dot-joined key `recordSpan` stores, folding
-    /// the section-name segment (index 0) the same way the parser folds it
-    /// under `case_insensitive_sections` -- see `foldedSection`. A 1-segment
-    /// path is a root-level global key, not a section, and is joined
-    /// verbatim; a subsection or leaf-key segment is never folded here.
+    /// Join `segments` into the dot-joined key `recordSpan` stores: the
+    /// section-name segment (index 0, only when there is a section --
+    /// `segments.len >= 2`) folds under `case_insensitive_sections` (see
+    /// `foldedSection`), and the leaf-key segment (the last one, at any
+    /// depth including a 1-segment root-level global key) folds under
+    /// `case_insensitive_keys` (see `foldedKey`) -- both match how the
+    /// parser stores them (`openHeader` / `storeKey` in parser.zig). A
+    /// subsection segment (index 1 of a 3-segment path) is never folded --
+    /// it is always stored case-sensitively.
     fn joinSectionFolded(self: *const Document, segments: []const []const u8) Allocator.Error![]const u8 {
-        if (segments.len < 2) return std.mem.join(self.arena, ".", segments);
         var out: std.ArrayList(u8) = .empty;
-        try out.appendSlice(self.arena, try self.foldedSection(segments[0]));
-        for (segments[1..]) |seg| {
-            try out.append(self.arena, '.');
-            try out.appendSlice(self.arena, seg);
+        for (segments, 0..) |seg, i| {
+            if (i > 0) try out.append(self.arena, '.');
+            const folded = if (i == 0 and segments.len >= 2)
+                try self.foldedSection(seg)
+            else if (i == segments.len - 1)
+                try self.foldedKey(seg)
+            else
+                seg;
+            try out.appendSlice(self.arena, folded);
         }
         return out.items;
     }
@@ -469,9 +536,11 @@ pub const Document = struct {
 
     /// Fold `key` the same way the parser will store it once it is written
     /// as a key: lower-cased under `case_insensitive_keys`, unchanged
-    /// otherwise. Used before a `Section.findValue` shadowing check so the
-    /// comparison matches what a re-parse will actually collide on, instead
-    /// of the byte-exact match `findValue` performs on its own.
+    /// otherwise. Used both before a `Section.findValue` shadowing check (so
+    /// the comparison matches what a re-parse will actually collide on,
+    /// instead of the byte-exact match `findValue` performs on its own) and
+    /// by `joinSectionFolded` to fold the leaf segment of a span-map lookup
+    /// key the same way `recordSpan` folded it when storing.
     fn foldedKey(self: *const Document, key: []const u8) Allocator.Error![]const u8 {
         return if (self.options.dialect.case_insensitive_keys)
             try parser_mod.toLowerAlloc(self.arena, key)
@@ -493,7 +562,7 @@ pub const Document = struct {
     /// Create and append the key (and its section/subsection, if missing)
     /// named by `segments`. Called only after `locateSegments` has already
     /// missed, so `segments` is known not to resolve today.
-    fn insertSegments(self: *Document, segments: []const []const u8, raw: []const u8) DocumentError!void {
+    fn insertSegments(self: *Document, segments: []const []const u8, raw: []const u8) DocumentError!ValueOffset {
         const max_depth = self.maxDepth();
         if (segments.len == 0 or segments.len > max_depth) return error.PathNotFound;
         const key = segments[segments.len - 1];
@@ -538,7 +607,7 @@ pub const Document = struct {
     /// Append a root-level (global) key: after the last existing global key,
     /// or at the very start of the document if there are none (global keys
     /// must precede every section header). Unindented.
-    fn insertGlobalKey(self: *Document, key: []const u8, raw: []const u8) DocumentError!void {
+    fn insertGlobalKey(self: *Document, key: []const u8, raw: []const u8) DocumentError!ValueOffset {
         var last_key: ?[]const u8 = null;
         for (self.parsed.section.entries) |e| {
             if (e.value == .section) break;
@@ -549,10 +618,13 @@ pub const Document = struct {
             const a = self.anchorsForSpan(self.spans.get(lk).?);
             at = a.line_end;
         }
+        const leading = leadingNewlineIfNeeded(self.source, at);
         const line = try std.fmt.allocPrint(self.arena, "{s}{s} {c} {s}{s}", .{
-            leadingNewlineIfNeeded(self.source, at), key, self.assignChar(), raw, dominantEol(self.source),
+            leading, key, self.assignChar(), raw, dominantEol(self.source),
         });
-        return self.recordSplice(at, at, line);
+        try self.recordSplice(at, at, line);
+        const value_start = leading.len + key.len + 3;
+        return .{ .start = value_start, .end = value_start + raw.len };
     }
 
     /// Append `key` into an already-resolved, existing `section`: after its
@@ -571,7 +643,7 @@ pub const Document = struct {
         section: *Section,
         key: []const u8,
         raw: []const u8,
-    ) DocumentError!void {
+    ) DocumentError!ValueOffset {
         var at: usize = undefined;
         var indent: []const u8 = undefined;
         if (lastScalarKey(section)) |last_key| {
@@ -593,10 +665,13 @@ pub const Document = struct {
         } else {
             return self.appendNewSection(container, key, raw);
         }
+        const leading = leadingNewlineIfNeeded(self.source, at);
         const line = try std.fmt.allocPrint(self.arena, "{s}{s}{s} {c} {s}{s}", .{
-            leadingNewlineIfNeeded(self.source, at), indent, key, self.assignChar(), raw, dominantEol(self.source),
+            leading, indent, key, self.assignChar(), raw, dominantEol(self.source),
         });
-        return self.recordSplice(at, at, line);
+        try self.recordSplice(at, at, line);
+        const value_start = leading.len + indent.len + key.len + 3;
+        return .{ .start = value_start, .end = value_start + raw.len };
     }
 
     /// Key of the last entry in `section` that is a scalar (string/list), not
@@ -619,16 +694,20 @@ pub const Document = struct {
     /// only place a header line is created, so a subsection is always a full
     /// new header -- gitconfig has no syntax for adding a subsection to an
     /// existing `[section]` block.
-    fn appendNewSection(self: *Document, container: []const []const u8, key: []const u8, raw: []const u8) DocumentError!void {
+    fn appendNewSection(self: *Document, container: []const []const u8, key: []const u8, raw: []const u8) DocumentError!ValueOffset {
         const nl = dominantEol(self.source);
         const header = if (container.len == 2) blk: {
             const sub = try escapeSubsectionName(self.arena, container[1]);
             break :blk try std.fmt.allocPrint(self.arena, "[{s} \"{s}\"]{s}", .{ container[0], sub, nl });
         } else try std.fmt.allocPrint(self.arena, "[{s}]{s}", .{ container[0], nl });
+        const sep = newSectionSeparator(self.source);
+        const indent = self.prevailingIndent();
         const text = try std.fmt.allocPrint(self.arena, "{s}{s}{s}{s} {c} {s}{s}", .{
-            newSectionSeparator(self.source), header, self.prevailingIndent(), key, self.assignChar(), raw, nl,
+            sep, header, indent, key, self.assignChar(), raw, nl,
         });
-        return self.recordSplice(self.source.len, self.source.len, text);
+        try self.recordSplice(self.source.len, self.source.len, text);
+        const value_start = sep.len + header.len + indent.len + key.len + 3;
+        return .{ .start = value_start, .end = value_start + raw.len };
     }
 
     /// Byte offset just past the source line of the first header matching
@@ -1894,11 +1973,55 @@ test "CREATE: repeating an identical create-set on a freshly created path is a b
     try testing.expectEqualStrings("x", v2.get("s.newkey").?.string);
 
     // A DIFFERENT value on the same freshly created path is still a genuine
-    // second edit, not swallowed by the cache.
+    // second edit, not swallowed by the cache -- and it overwrites the prior
+    // create in place (one line) rather than appending a second line, which
+    // would silently turn "s.newkey" from a scalar into a 2-element list
+    // under gitconfig's accumulate duplicate-key policy.
     try doc.set("s.newkey", @as([]const u8, "y"));
     var aw3: std.Io.Writer.Allocating = .init(a);
     try doc.emit(&aw3.writer);
     try testing.expect(!std.mem.eql(u8, out1, aw3.written()));
+    try testing.expectEqualStrings("y", doc.get("s.newkey").?.string);
+    const v3 = try parser_mod.parse(a, aw3.written(), .{ .dialect = G });
+    try testing.expectEqualStrings("y", v3.get("s.newkey").?.string);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, aw3.written(), "newkey"));
+}
+
+test "CREATE: a case-variant KEY under a case-folding dialect resolves into the existing key (BUG2)" {
+    // gitconfig folds keys (and sections) but not subsections. A case-variant
+    // KEY must resolve INTO the already-parsed entry instead of falling
+    // through to the create path and appending a duplicate line, which would
+    // silently turn a scalar into a 2-element list under gitconfig's
+    // accumulate duplicate-key policy.
+    const G = Dialect.gitconfig;
+    const src = "[core]\n\tautocrlf = input\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.setSegments(&.{ "core", "AUTOCRLF" }, @as([]const u8, "false"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[core]\n\tautocrlf = false\n", out);
+    try testing.expectEqualStrings("false", doc.get("core.autocrlf").?.string);
+    const v2 = try parser_mod.parse(a, out, .{ .dialect = G });
+    try testing.expectEqualStrings("false", v2.get("core.autocrlf").?.string);
+}
+
+test "CREATE: a case-variant KEY under a case-sensitive dialect stays distinct" {
+    // strict never folds key names, so "AUTOCRLF" and the existing
+    // "autocrlf" are genuinely distinct keys, matching set()'s ordinary
+    // create-missing behavior.
+    const src = "[core]\nautocrlf = input\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.strict });
+    try doc.setSegments(&.{ "core", "AUTOCRLF" }, @as([]const u8, "false"));
+    const out = try emitAndReparse(a, &doc, .{ .dialect = Dialect.strict });
+    try testing.expectEqualStrings("[core]\nautocrlf = input\nAUTOCRLF = false\n", out);
+    const v2 = try parser_mod.parse(a, out, .{ .dialect = Dialect.strict });
+    try testing.expectEqualStrings("input", v2.get("core.autocrlf").?.string);
+    try testing.expectEqualStrings("false", v2.get("core.AUTOCRLF").?.string);
 }
 
 test "DOC1: repeating an identical set on an empty existing value is a byte-identical no-op" {

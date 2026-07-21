@@ -23,6 +23,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (a zero-width splice). The latter risked silently turning a scalar value
   into a multi-value list under an accumulating dialect (e.g. gitconfig) on
   a plain repeat.
+- `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments`:
+  re-setting a path an earlier edit in the same session already created, to a
+  DIFFERENT value, now overwrites that create in place instead of appending a
+  second line for the same key. Previously only a byte-identical repeat was
+  recognized as a no-op; a differing value fell through to the append path
+  and, under an accumulating dialect (e.g. gitconfig), silently turned the
+  key's read-back from a scalar into a multi-value list.
+- `Document.set` / `setLiteral` / `setSegments` / `setLiteralSegments`:
+  resolving a path into an existing KEY under a case-folding dialect
+  (`generic`, `gitconfig`, `windows`) now matches a differently-cased key
+  name (e.g. `AUTOCRLF`) into the already-stored key (`autocrlf`) instead of
+  appending a case-variant duplicate line that would only merge with it --
+  and, under an accumulating dialect, turn a scalar into a list -- on the
+  next re-parse. This mirrors the section-name case fold already applied;
+  subsection names remain unaffected, always matched case-sensitively
+  regardless of dialect.
 
 ## [0.3.0] - 2026-07-21
 
