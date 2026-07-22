@@ -157,6 +157,18 @@ fn genValueList(a: std.mem.Allocator, rng: std.Random) ![]const []const u8 {
     return out;
 }
 
+/// Length of the longest physical line in `source` (including any trailing
+/// `\r`), for `checkSectionValue`'s `force_line_too_long` mode: sizing
+/// `max_line_len` a little above this keeps every line `source` already has
+/// well within bounds, while a deliberately longer entry value still trips
+/// it.
+fn longestLineLen(source: []const u8) usize {
+    var longest: usize = 0;
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| longest = @max(longest, line.len);
+    return longest;
+}
+
 fn recordModel(a: std.mem.Allocator, model: *std.ArrayList(ModelEntry), segs: []const []const u8, value: []const u8) !void {
     for (model.items) |*e| {
         if (e.len == segs.len and segsEqual(e.segs[0..e.len], segs)) {
@@ -1371,7 +1383,22 @@ fn checkSectionValue(
 ) !void {
     var containers: std.ArrayList([]const []const u8) = .empty;
     for (gen.model) |e| if (e.len >= 2) try containers.append(a, e.segs[0 .. e.len - 1]);
-    const container = if (containers.items.len > 0 and rng.uintLessThan(u8, 100) < 40)
+
+    // Occasionally exercise the atomicity class that passes
+    // `validateSectionValue`'s up-front check but fails only once
+    // `applySectionValue` reaches that entry's own `refreshView` re-parse:
+    // a MERGE into an existing container whose second entry's rendered
+    // line is deliberately too long for a `max_line_len` sized to still
+    // comfortably fit every line `gen.source` already has. This is gated
+    // on an existing container (a genuine merge, not a fresh append) so the
+    // first entry commits its own splice before the second one fails,
+    // which is exactly the shape `setSectionSegments`'s transaction must
+    // undo -- Invariant 1 below then checks the whole call rolled back.
+    const force_line_too_long = containers.items.len > 0 and rng.uintLessThan(u8, 100) < 12;
+
+    const container = if (force_line_too_long)
+        containers.items[rng.uintLessThan(usize, containers.items.len)]
+    else if (containers.items.len > 0 and rng.uintLessThan(u8, 100) < 40)
         containers.items[rng.uintLessThan(usize, containers.items.len)]
     else blk: {
         const depth: usize = if (dialect.subsections == .quoted and rng.boolean()) 2 else 1;
@@ -1380,26 +1407,45 @@ fn checkSectionValue(
         break :blk segs;
     };
 
-    const n = rng.intRangeAtMost(usize, 1, 2);
-    const entries = try a.alloc(ini.value.Entry, n);
+    var max_line_len: usize = 16 << 20;
+    var entries: []ini.value.Entry = undefined;
     var desc: std.ArrayList(u8) = .empty;
-    for (entries, 0..) |*e, i| {
+
+    if (force_line_too_long) {
+        max_line_len = longestLineLen(gen.source) + 32;
         ctr.* += 1;
-        const key = try std.fmt.allocPrint(a, "sv{d}", .{ctr.*});
-        if (dialect.duplicate_keys == .accumulate and rng.boolean()) {
-            const items = try a.alloc([]const u8, rng.intRangeAtMost(usize, 2, 3));
-            for (items) |*v| v.* = genTargetValue(rng);
-            e.* = .{ .key = key, .value = .{ .list = items } };
-        } else {
-            e.* = .{ .key = key, .value = .{ .string = genTargetValue(rng) } };
+        const good_key = try std.fmt.allocPrint(a, "sv{d}", .{ctr.*});
+        ctr.* += 1;
+        const big_key = try std.fmt.allocPrint(a, "sv{d}", .{ctr.*});
+        const big_value = try a.alloc(u8, max_line_len + 64);
+        @memset(big_value, 'x');
+        entries = try a.alloc(ini.value.Entry, 2);
+        entries[0] = .{ .key = good_key, .value = .{ .string = genTargetValue(rng) } };
+        entries[1] = .{ .key = big_key, .value = .{ .string = big_value } };
+        try desc.appendSlice(a, good_key);
+        try desc.append(a, ',');
+        try desc.appendSlice(a, big_key);
+    } else {
+        const n = rng.intRangeAtMost(usize, 1, 2);
+        entries = try a.alloc(ini.value.Entry, n);
+        for (entries, 0..) |*e, i| {
+            ctr.* += 1;
+            const key = try std.fmt.allocPrint(a, "sv{d}", .{ctr.*});
+            if (dialect.duplicate_keys == .accumulate and rng.boolean()) {
+                const items = try a.alloc([]const u8, rng.intRangeAtMost(usize, 2, 3));
+                for (items) |*v| v.* = genTargetValue(rng);
+                e.* = .{ .key = key, .value = .{ .list = items } };
+            } else {
+                e.* = .{ .key = key, .value = .{ .string = genTargetValue(rng) } };
+            }
+            if (i > 0) try desc.append(a, ',');
+            try desc.appendSlice(a, key);
         }
-        if (i > 0) try desc.append(a, ',');
-        try desc.appendSlice(a, key);
     }
     var sec = ini.Section{ .entries = entries };
     const desc_str = desc.items;
 
-    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect }) catch |err| {
+    var doc = ini.Document.parse(a, gen.source, .{ .dialect = dialect, .max_line_len = max_line_len }) catch |err| {
         report(dialect_name, idx, seed, gen.source, container, desc_str, null, "section: source failed to parse");
         return err;
     };

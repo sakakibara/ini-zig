@@ -356,13 +356,13 @@ pub const Document = struct {
     ///   the end of the document, separated the same way a single created
     ///   key's section would be. Every entry's key and rendered value is
     ///   validated up front, before any splice, so a rejected entry anywhere
-    ///   in the tree leaves the document untouched; validation does not
-    ///   re-check the actual re-parse (only `setSegments`/`setListSegments`
-    ///   do that, splice by splice), so on a MERGE with several entries a
-    ///   value that passes validation but still fails re-parse (e.g. one that
-    ///   trips only `refreshView`'s own check) can leave earlier entries in
-    ///   the tree already applied -- a narrower guarantee than a single
-    ///   leaf's set, which is always fully atomic.
+    ///   in the tree leaves the document untouched; the whole call is also a
+    ///   single transaction across every entry it applies (see
+    ///   `setSectionSegments`), so a value that passes that up-front
+    ///   validation but still fails the actual re-parse (e.g. one that trips
+    ///   only `refreshView`'s own check, such as exceeding `max_line_len`)
+    ///   rolls the ENTIRE call back, not just the entry that failed --
+    ///   the same all-or-nothing guarantee a single leaf's set already has.
     ///
     /// The multi-value line model matches how THIS dialect's parser reads
     /// repeated keys back (`duplicate_keys`): only under `.accumulate` does
@@ -642,10 +642,31 @@ pub const Document = struct {
 
     /// `setValueSegments`'s `.section` branch: validate the whole tree `sec`
     /// roots (see `validateSectionValue`) before touching anything, then
-    /// apply it (see `applySectionValue`).
+    /// apply it (see `applySectionValue`) as one transaction. `applySectionValue`
+    /// (and, for a brand-new container, `appendNewSectionEntries`) applies each
+    /// entry via its own independently-atomic leaf setter, so a failure on
+    /// entry N does not by itself disturb entries `1..N-1`'s splices -- but
+    /// nothing else wraps the loop across entries, so without this a failure
+    /// on entry N leaves those earlier entries committed. Restoring the
+    /// pre-call splice list, `seq`, and `created`/`created_lists` snapshots
+    /// makes the whole call genuinely all-or-nothing, matching `recordSplice`'s
+    /// guarantee for a single leaf edit.
     fn setSectionSegments(self: *Document, segments: []const []const u8, sec: *const Section) DocumentError!void {
         try self.validateSectionValue(segments, sec);
-        return self.applySectionValue(segments, sec);
+
+        const saved_splices_len = self.splices.items.len;
+        const saved_seq = self.seq;
+        const saved_created = try self.created.clone(self.arena);
+        const saved_created_lists = try self.created_lists.clone(self.arena);
+
+        self.applySectionValue(segments, sec) catch |e| {
+            self.splices.shrinkRetainingCapacity(saved_splices_len);
+            self.seq = saved_seq;
+            self.created = saved_created;
+            self.created_lists = saved_created_lists;
+            self.refreshView() catch |e2| return e2;
+            return e;
+        };
     }
 
     /// Recursively validate that `sec` can be materialized at `segments` (a
@@ -712,7 +733,11 @@ pub const Document = struct {
     /// merge into an existing section/subsection leaf by leaf (reusing
     /// `setSegments`/`setListSegments`, and this same function recursively
     /// for a nested `.section` entry), or append a whole new one when it is
-    /// entirely or partially missing.
+    /// entirely or partially missing. Not itself transactional across the
+    /// entries it loops over -- only `setSectionSegments`, the sole caller
+    /// (directly or via recursion for a nested `.section`), wraps the whole
+    /// call in one transaction; a bare `applySectionValue` failure can leave
+    /// earlier entries already spliced.
     fn applySectionValue(self: *Document, segments: []const []const u8, sec: *const Section) DocumentError!void {
         if (try self.resolveContainer(segments)) |_| {
             for (sec.entries) |entry| {
@@ -977,12 +1002,15 @@ pub const Document = struct {
     /// line in the document (of any name), or to the start of a run of
     /// comment lines immediately preceding that next header (so a comment
     /// documenting the FOLLOWING section is left with it rather than swept
-    /// into this removal), or to end-of-source if it is the last section.
-    /// Empty if no header matches `container`. Only ever called after
-    /// `resolveContainer` has already confirmed `container` resolves to a
-    /// section, so an empty result in practice never happens under any of
-    /// this library's built-in dialects; `removeSegments` treats it as
-    /// `error.PathNotFound` rather than removing the wrong bytes.
+    /// into this removal), or, if it is the LAST section in the document, to
+    /// end-of-source -- extended backward over its own leading run of wholly
+    /// blank lines too (see `ownedLeadingBlankStart`), since with no next
+    /// header to own that separator it would otherwise dangle. Empty if no
+    /// header matches `container`. Only ever called after `resolveContainer`
+    /// has already confirmed `container` resolves to a section, so an empty
+    /// result in practice never happens under any of this library's built-in
+    /// dialects; `removeSegments` treats it as `error.PathNotFound` rather
+    /// than removing the wrong bytes.
     fn sectionBlockRanges(self: *const Document, container: []const []const u8) Allocator.Error![]const BlockRange {
         const d = self.options.dialect;
         var tz = tok.Tokenizer.init(self.source, d);
@@ -1021,7 +1049,17 @@ pub const Document = struct {
                 else => comment_run_start = null,
             }
         }
-        if (open_start) |s| try ranges.append(self.arena, .{ .start = s, .end = self.source.len });
+        if (open_start) |s| {
+            // Clamped to the previous matching block's own `end` (if any):
+            // when this container matched an earlier block with nothing but
+            // this trailing block in between, that earlier block's range
+            // already extends up to this header (its OWN trailing separator
+            // convention), so walking back any further would re-claim bytes
+            // that range already covers -- a genuine overlap `recordSplice`
+            // would otherwise reject as `error.ConflictingEdit`.
+            const floor = if (ranges.items.len > 0) ranges.items[ranges.items.len - 1].end else 0;
+            try ranges.append(self.arena, .{ .start = ownedLeadingBlankStart(self.source, s, floor), .end = self.source.len });
+        }
         return ranges.items;
     }
 
@@ -1888,6 +1926,33 @@ fn newSectionSeparator(source: []const u8) []const u8 {
 fn leadingNewlineIfNeeded(source: []const u8, at: usize) []const u8 {
     if (at == 0 or source[at - 1] == '\n') return "";
     return dominantEol(source);
+}
+
+/// `hdr_start` extended backward over the contiguous run of wholly blank
+/// lines immediately preceding it -- the separator (see `newSectionSeparator`)
+/// that introduced this header, with no surviving content left to own it once
+/// the header itself is removed. `hdr_start` always sits right after a
+/// newline or at 0 (a header always starts its own line), so each step looks
+/// at the ONE line immediately before the current position: if it has any
+/// content besides its own line terminator, the run has ended and that
+/// position is returned as-is (a section that directly follows other content,
+/// or is preceded by only ONE section with no separator at all, is
+/// untouched). Never walks below `floor` (see `sectionBlockRanges`'s only
+/// caller, which passes the previous matching block's own `end` so this
+/// cannot re-claim bytes that block's range already covers). Only meaningful
+/// for the last section-matching block in the document; a block with a
+/// following header keeps its own leading separator, since that reads as the
+/// FOLLOWING header's own separator instead.
+fn ownedLeadingBlankStart(source: []const u8, hdr_start: usize, floor: usize) usize {
+    var pos = hdr_start;
+    while (pos > floor) {
+        var line_start = pos - 1;
+        while (line_start > floor and source[line_start - 1] != '\n') line_start -= 1;
+        const line = std.mem.trimEnd(u8, source[line_start..pos], "\r\n");
+        if (line.len != 0) break;
+        pos = line_start;
+    }
+    return pos;
 }
 
 /// Ordering for the splice list: by start, then insertions (zero-width) before
@@ -4094,4 +4159,112 @@ test "SECTION: removeSegments through a scalar container is InvalidValue, not a 
     var aw: std.Io.Writer.Allocating = .init(a);
     try doc.emit(&aw.writer);
     try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments merge is all-or-nothing when a later entry collides under duplicate_keys = .err" {
+    // Reproduces the cross-entry atomicity gap directly: "good" applies and
+    // commits its own splice first, then "multi" collides with the section's
+    // existing key once its second list line is appended -- without a
+    // transaction wrapping the whole entry loop, "good = ok" would stay
+    // spliced in even though the overall call returns an error.
+    const G: Dialect = blk: {
+        var d = Dialect.gitconfig;
+        d.duplicate_keys = .err;
+        break :blk d;
+    };
+    const src = "[user]\n\tmulti = x\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var entries = [_]value_mod.Entry{
+        .{ .key = "good", .value = .{ .string = "ok" } },
+        .{ .key = "multi", .value = .{ .list = &.{ "a", "b" } } },
+    };
+    var sec = Section{ .entries = &entries };
+    try testing.expectError(error.DuplicateKey, doc.setValueSegments(&.{"user"}, .{ .section = &sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments append is all-or-nothing when a nested subsection's own entry collides" {
+    // Reproduces the append-path atomicity gap: the new [remote] header
+    // block (with "note") commits as its own splice, then the nested
+    // [remote "origin"] subsection's list entry collides with itself once
+    // both lines land in the same append -- without a transaction, the
+    // "[remote]" block would be left behind even though the overall call
+    // returns an error.
+    const G: Dialect = blk: {
+        var d = Dialect.gitconfig;
+        d.duplicate_keys = .err;
+        break :blk d;
+    };
+    const src = "[core]\n\tbare = false\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    var origin_entries = [_]value_mod.Entry{
+        .{ .key = "url", .value = .{ .list = &.{ "a", "b" } } },
+    };
+    var origin_sec = Section{ .entries = &origin_entries };
+    var remote_entries = [_]value_mod.Entry{
+        .{ .key = "note", .value = .{ .string = "top" } },
+        .{ .key = "origin", .value = .{ .section = &origin_sec } },
+    };
+    var remote_sec = Section{ .entries = &remote_entries };
+    try testing.expectError(error.DuplicateKey, doc.setValueSegments(&.{"remote"}, .{ .section = &remote_sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: setValueSegments merge is all-or-nothing when a later entry's line exceeds max_line_len" {
+    // The built-in gitconfig dialect at its own defaults -- only
+    // `max_line_len` (a `ParseOptions` knob, not a dialect field) is small.
+    // `validateRenderedLeaf` never bounds rendered length, so this passes
+    // up-front validation and fails only once `refreshView` re-parses the
+    // second entry's own line -- proving the gap is not gated on an exotic
+    // `duplicate_keys` dialect at all.
+    const src = "[user]\n\tname = Ada\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = Dialect.gitconfig, .max_line_len = 64 });
+    const big = "x" ** 200;
+    var entries = [_]value_mod.Entry{
+        .{ .key = "good", .value = .{ .string = "ok" } },
+        .{ .key = "big", .value = .{ .string = big } },
+    };
+    var sec = Section{ .entries = &entries };
+    try testing.expectError(error.LineTooLong, doc.setValueSegments(&.{"user"}, .{ .section = &sec }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "SECTION: removeSegments of the trailing section also consumes its own leading blank separator" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n\n[b]\n\ty = 2\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{"b"});
+    const out = try emitAndReparse(a, &doc, .{ .dialect = G });
+    try testing.expectEqualStrings("[a]\n\tx = 1\n", out);
+}
+
+test "SECTION: removeSegments of the only section in the document leaves nothing behind" {
+    const G = Dialect.gitconfig;
+    const src = "[a]\n\tx = 1\n\n";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, src, .{ .dialect = G });
+    try doc.removeSegments(&.{"a"});
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("", aw.written());
 }
